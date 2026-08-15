@@ -63,7 +63,8 @@ export default {
       const page = await browser.newPage();
       await page.setUserAgent("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1");
       await page.setViewport({ width: 430, height: 932, deviceScaleFactor: 1 });
-      await page.goto(target.href, { waitUntil: "networkidle2", timeout: 15000 });
+      await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await new Promise(resolve => setTimeout(resolve, 2500));
       await acceptCookies(page);
       const locationApplied = await setLocation(page, String(body.cap || ""));
       const result = await extract(page, String(body.query || "")), finalUrl = page.url();
