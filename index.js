@@ -20,8 +20,8 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const allowedHost = host => ROOT_HOSTS.some(root => host === root || host.endsWith(`.${root}`));
 
 const ADAPTERS = {
-  "aldi.it": { url: "https://www.aldi.it/offerte-settimanali", wait: 4500 },
-  "mdspa.it": { url: "https://volantino.mdspa.it/", wait: 5000 },
+  "aldi.it": { url: "https://www.aldi.it/offerte-settimanali/offerte-di-questa-settimana", direct: true },
+  "mdspa.it": { url: "https://volantino.mdspa.it/m_nord.html", direct: true },
   "esselunga.it": { url: "https://www.esselunga.it/it-it/promozioni/volantini.html", wait: 5000 },
   "carrefour.it": { url: "https://www.carrefour.it/volantino", wait: 5000 },
   "conad.it": { url: "https://www.conad.it/offerte-e-promozioni", wait: 5000 },
@@ -31,6 +31,42 @@ const ADAPTERS = {
 
 function adapterFor(host) {
   return Object.entries(ADAPTERS).find(([root]) => host === root || host.endsWith(`.${root}`))?.[1];
+}
+
+function decodeHtml(value) {
+  return value
+    .replace(/<script[\s\S]*?<\/script>/gi, match => match.includes("__NUXT_DATA__") ? match : " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, "\n")
+    .replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/&euro;|&#8364;/gi, "€")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;|&#34;/gi, '"')
+    .replace(/\\u20ac/gi, "€")
+    .replace(/\\u002F/gi, "/")
+    .replace(/\\n|\\r|\\t/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
+function directExtract(html, query) {
+  const clean = decodeHtml(html);
+  const wanted = query.trim().toLowerCase();
+  const stems = wanted.split(/\s+/).filter(x => x.length > 2).map(x => x.length > 5 ? x.slice(0, -1) : x);
+  if (!stems.length) return { result: "", matches: 0, offers: [] };
+  const lower = clean.toLowerCase();
+  const chunks = [];
+  let cursor = 0;
+  while (cursor < lower.length && chunks.length < 80) {
+    const index = lower.indexOf(stems[0], cursor);
+    if (index < 0) break;
+    const chunk = clean.slice(Math.max(0, index - 900), Math.min(clean.length, index + 1800));
+    const normalized = chunk.replace(/\n+/g, "\n").trim();
+    if (stems.every(stem => normalized.toLowerCase().includes(stem)) && /€|\b\d+[,.]\d{2}\b/.test(normalized)) chunks.push(normalized);
+    cursor = index + stems[0].length;
+  }
+  const unique = [...new Set(chunks)];
+  return { result: unique.join("\n---\n"), matches: unique.length, offers: [] };
 }
 
 async function launchBrowser(binding) {
@@ -133,7 +169,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 3 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 4 });
     let browser;
     try {
       const body = await request.json();
@@ -141,6 +177,13 @@ export default {
       if (requested.protocol !== "https:" || !allowedHost(requested.hostname)) return json({ error: "Sito non autorizzato" }, 403);
       const adapter = adapterFor(requested.hostname);
       const target = new URL(adapter?.url || requested.href);
+      if (adapter?.direct) {
+        const response = await fetch(target.href, { headers: { "User-Agent": "Mozilla/5.0 (compatible; SpesaMeno/1.0)" } });
+        if (!response.ok) throw new Error(`Fonte ${response.status}`);
+        const html = await response.text();
+        const extracted = directExtract(html, String(body.query || ""));
+        return json({ success: true, chainAdapter: Object.keys(ADAPTERS).find(root => requested.hostname.endsWith(root)), locationApplied: false, finalUrl: target.href, pageTitle: "", ...extracted });
+      }
       browser = await launchBrowser(env.BROWSER);
       const page = await browser.newPage();
       const payloads = [];
