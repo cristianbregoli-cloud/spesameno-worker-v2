@@ -1,0 +1,10 @@
+SPESAMENO - INSTALLAZIONE GRATUITA SU CLOUDFLARE
+
+1. Nel pannello Cloudflare apri la Home.
+2. Trascina questo file ZIP nel riquadro “Drop a folder, or a zip”.
+3. Conferma il nome “spesameno-browser”.
+4. Se Cloudflare propone un piano, mantieni “Workers Free”.
+5. Premi Deploy.
+6. Copia soltanto l'indirizzo pubblico che termina con workers.dev.
+
+Non creare token API, non inserire carte e non acquistare piani.

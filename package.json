@@ -1,0 +1,12 @@
+{
+  "name": "spesameno-browser-worker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/puppeteer": "^1.1.0",
+    "wrangler": "^4.30.0"
+  }
+}
