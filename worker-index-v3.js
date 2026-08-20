@@ -171,15 +171,19 @@ async function extractOffers(page, query, payloads) {
     }
   }
   const cards = data.cards.filter((card, index, array) => array.findIndex(x => x.text === card.text) === index);
+  // Product grids often wrap the matching card in larger category containers.
+  // When a compact product card exists, discard those noisy parent containers.
+  const compactCards = cards.filter(card => card.text.length <= 700);
+  const selectedCards = compactCards.length ? compactCards : cards;
   const legacy = [...new Set(contexts)].slice(0, 120).join("\n---\n");
-  const result = cards.length ? cards.map(card => `${card.text}\n${card.image}\n${card.link}`).join("\n---\n") : legacy;
-  return { result, offers: cards, matches: cards.length || contexts.length, pageTitle: data.title, finalUrl: data.url };
+  const result = selectedCards.length ? selectedCards.map(card => `${card.text}\n${card.image}\n${card.link}`).join("\n---\n") : legacy;
+  return { result, offers: selectedCards, matches: selectedCards.length || contexts.length, pageTitle: data.title, finalUrl: data.url };
 }
 
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 7 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 8 });
     let browser;
     try {
       const body = await request.json();
