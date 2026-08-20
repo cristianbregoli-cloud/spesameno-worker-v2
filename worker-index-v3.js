@@ -115,26 +115,23 @@ async function applyPostcode(page, cap, flow = "") {
     // Real keystrokes are required by the React-controlled store finders.
     await page.keyboard.type(cap, { delay: 70 });
     await sleep(1200);
-    await page.evaluate(({ postcode, storeFlow }) => {
-      const inputs = [...document.querySelectorAll("input:not([type=hidden])")];
-      const input = inputs.find(el => String(el.value || "").includes(postcode));
-      const controls = [...document.querySelectorAll("button,[role=button],input[type=submit]")]
-        .filter(el => el.offsetParent !== null);
-      const label = el => (el.textContent || el.value || el.getAttribute("aria-label") || "").trim().toLowerCase();
-      let button;
-      if (storeFlow === "conad") {
-        // Conad exposes two "Cerca" buttons: the store finder is the last visible one.
-        button = controls.filter(el => label(el) === "cerca").at(-1);
-      } else if (storeFlow === "esselunga") {
-        button = controls.find(el => label(el).includes("avvia ricerca"));
-      }
-      if (!button) {
-        const scope = input?.closest("form") || input?.closest("main") || document.querySelector("main") || document;
-        button = [...scope.querySelectorAll("button,[role=button],input[type=submit]")]
-          .find(el => /^(cerca|trova|avvia ricerca|conferma|applica|seleziona|continua|vai|usa)/.test(label(el)));
-      }
-      button?.click();
-    }, { postcode: cap, storeFlow: flow }).catch(() => undefined);
+    // Use Puppeteer's mouse click (trusted event), not DOM element.click().
+    const controls = await page.$$("button,[role=button],input[type=submit]");
+    const candidates = [];
+    for (const control of controls) {
+      const info = await control.evaluate((el, storeFlow) => {
+        const label = (el.textContent || el.value || el.getAttribute("aria-label") || "").trim().toLowerCase();
+        const visible = Boolean(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+        const exact = storeFlow === "conad" ? label === "cerca"
+          : storeFlow === "esselunga" ? label.includes("avvia ricerca")
+          : /^(cerca|trova|avvia ricerca|conferma|applica|seleziona|continua|vai|usa)/.test(label);
+        return { visible, exact };
+      }, flow).catch(() => ({ visible: false, exact: false }));
+      if (info.visible && info.exact) candidates.push(control);
+    }
+    const target = flow === "conad" ? candidates.at(-1) : candidates[0];
+    if (target) await target.click().catch(() => undefined);
+    else await page.keyboard.press("Enter").catch(() => undefined);
     await sleep(5500);
   }
   return applied;
@@ -249,7 +246,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 13 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 14 });
     let browser;
     try {
       const body = await request.json();
