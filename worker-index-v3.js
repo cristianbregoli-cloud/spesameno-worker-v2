@@ -100,30 +100,41 @@ async function clickConsent(page) {
   await sleep(800);
 }
 
-async function applyPostcode(page, cap) {
+async function applyPostcode(page, cap, flow = "") {
   if (!/^\d{5}$/.test(cap)) return false;
-  const applied = await page.evaluate(postcode => {
+  const applied = await page.evaluate(() => {
     const hints = /cap|codice postale|localit|comune|indirizzo|negozio|punto vendita|store|postal|zip/;
     const inputs = [...document.querySelectorAll("input:not([type=hidden])")];
     const input = inputs.find(el => hints.test(`${el.placeholder} ${el.name} ${el.id} ${el.getAttribute("aria-label")}`.toLowerCase()));
     if (!input) return false;
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-    setter?.call(input, postcode);
     input.focus();
-    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: postcode }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.select();
     return true;
-  }, cap).catch(() => false);
+  }).catch(() => false);
   if (applied) {
+    // Real keystrokes are required by the React-controlled store finders.
+    await page.keyboard.type(cap, { delay: 70 });
     await sleep(1200);
-    await page.evaluate(postcode => {
+    await page.evaluate(({ postcode, storeFlow }) => {
       const inputs = [...document.querySelectorAll("input:not([type=hidden])")];
       const input = inputs.find(el => String(el.value || "").includes(postcode));
-      const scope = input?.closest("main") || document.querySelector("main") || document;
-      const controls = [...scope.querySelectorAll("button,[role=button],input[type=submit]")];
-      const button = controls.find(el => /^(cerca|trova|avvia ricerca|conferma|applica|seleziona|continua|vai|usa)/.test((el.textContent || el.value || el.getAttribute("aria-label") || "").trim().toLowerCase()));
+      const controls = [...document.querySelectorAll("button,[role=button],input[type=submit]")]
+        .filter(el => el.offsetParent !== null);
+      const label = el => (el.textContent || el.value || el.getAttribute("aria-label") || "").trim().toLowerCase();
+      let button;
+      if (storeFlow === "conad") {
+        // Conad exposes two "Cerca" buttons: the store finder is the last visible one.
+        button = controls.filter(el => label(el) === "cerca").at(-1);
+      } else if (storeFlow === "esselunga") {
+        button = controls.find(el => label(el).includes("avvia ricerca"));
+      }
+      if (!button) {
+        const scope = input?.closest("form") || input?.closest("main") || document.querySelector("main") || document;
+        button = [...scope.querySelectorAll("button,[role=button],input[type=submit]")]
+          .find(el => /^(cerca|trova|avvia ricerca|conferma|applica|seleziona|continua|vai|usa)/.test(label(el)));
+      }
       button?.click();
-    }, cap).catch(() => undefined);
+    }, { postcode: cap, storeFlow: flow }).catch(() => undefined);
     await sleep(5500);
   }
   return applied;
@@ -144,7 +155,7 @@ async function firstMatchingHref(page, rules) {
 
 async function resolveStoreOffers(page, flow, cap) {
   if (!flow) return { locationApplied: await applyPostcode(page, cap), storeUrl: "" };
-  const locationApplied = await applyPostcode(page, cap);
+  const locationApplied = await applyPostcode(page, cap, flow);
   if (!locationApplied) return { locationApplied: false, storeUrl: "" };
   await sleep(3500);
 
@@ -238,7 +249,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 12 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 13 });
     let browser;
     try {
       const body = await request.json();
