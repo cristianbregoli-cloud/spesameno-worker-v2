@@ -149,7 +149,8 @@ async function extractOffers(page, query, payloads) {
     const results = [];
     for (const card of cards) {
       const text = normalize(card.innerText || card.textContent);
-      if (!hit(text) || text.length < 5 || text.length > 5000) continue;
+      const hasPrice = /€|\b\d+[,.]\d{2}\b|prezzo\s*(?:speciale|promo|offerta)/i.test(text);
+      if (!hit(text) || !hasPrice || text.length < 5 || text.length > 5000) continue;
       const image = card.querySelector("img")?.currentSrc || card.querySelector("img")?.src || "";
       const link = card.closest("a")?.href || card.querySelector("a")?.href || location.href;
       results.push({ text, image, link });
@@ -165,7 +166,8 @@ async function extractOffers(page, query, payloads) {
   const contexts = [];
   for (let i = 0; i < rawLines.length; i++) {
     if (stems.length && stems.every(stem => rawLines[i].toLowerCase().includes(stem))) {
-      contexts.push(rawLines.slice(Math.max(0, i - 5), i + 14).join("\n"));
+      const context = rawLines.slice(Math.max(0, i - 5), i + 14).join("\n");
+      if (/€|\b\d+[,.]\d{2}\b|prezzo\s*(?:speciale|promo|offerta)/i.test(context)) contexts.push(context);
     }
   }
   const cards = data.cards.filter((card, index, array) => array.findIndex(x => x.text === card.text) === index);
@@ -177,7 +179,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 5 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 6 });
     let browser;
     try {
       const body = await request.json();
