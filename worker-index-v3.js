@@ -135,11 +135,14 @@ async function applyPostcode(page, cap) {
       await page.keyboard.press("Enter").catch(() => undefined);
     }
     await sleep(1000);
-    await page.evaluate(() => {
-      const controls = [...document.querySelectorAll("button,[role=button],input[type=submit]")];
-      const button = controls.find(el => /^(cerca|trova|conferma|applica|seleziona|continua|vai|usa)/.test((el.textContent || el.value || "").trim().toLowerCase()));
+    await page.evaluate(postcode => {
+      const inputs = [...document.querySelectorAll("input:not([type=hidden])")];
+      const input = inputs.find(el => String(el.value || "").includes(postcode));
+      const scope = input?.closest("main,form,section,[class*=search],[class*=locator]") || document.querySelector("main") || document;
+      const controls = [...scope.querySelectorAll("button,[role=button],input[type=submit]")];
+      const button = controls.find(el => /^(cerca|trova|avvia ricerca|conferma|applica|seleziona|continua|vai|usa)/.test((el.textContent || el.value || el.getAttribute("aria-label") || "").trim().toLowerCase()));
       button?.click();
-    }).catch(() => undefined);
+    }, cap).catch(() => undefined);
     await sleep(5500);
   }
   return applied;
@@ -254,7 +257,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 10 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 11 });
     let browser;
     try {
       const body = await request.json();
