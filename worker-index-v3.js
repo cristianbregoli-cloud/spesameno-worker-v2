@@ -22,9 +22,9 @@ const allowedHost = host => ROOT_HOSTS.some(root => host === root || host.endsWi
 const ADAPTERS = {
   "aldi.it": { url: "https://www.aldi.it/speciali-della-settimana", wait: 6000 },
   "mdspa.it": { url: "https://volantino.mdspa.it/m_nord.html", direct: true },
-  "esselunga.it": { url: "https://www.esselunga.it/it-it/promozioni/volantini.html", wait: 5000 },
+  "esselunga.it": { url: "https://www.esselunga.it/it-it/negozi.html", wait: 5000, storeFlow: "esselunga" },
   "carrefour.it": { url: "https://www.carrefour.it/volantino", wait: 5000 },
-  "conad.it": { url: "https://www.conad.it/offerte-e-promozioni", wait: 5000 },
+  "conad.it": { url: "https://www.conad.it/ricerca-negozi", wait: 5000, storeFlow: "conad" },
   "unes.it": { url: "https://www.unes.it/it/seleziona-volantino", wait: 5000 },
   "penny.it": { url: "https://www.penny.it/offerte", wait: 4000 }
 };
@@ -122,6 +122,54 @@ async function applyPostcode(page, cap) {
   return applied;
 }
 
+async function firstMatchingHref(page, rules) {
+  return page.evaluate(patterns => {
+    const links = [...document.querySelectorAll("a[href]")];
+    for (const rule of patterns) {
+      const regex = new RegExp(rule.href, "i");
+      const textRegex = rule.text ? new RegExp(rule.text, "i") : null;
+      const link = links.find(el => regex.test(el.href) && (!textRegex || textRegex.test((el.textContent || "").trim())));
+      if (link) return link.href;
+    }
+    return "";
+  }, rules).catch(() => "");
+}
+
+async function resolveStoreOffers(page, flow, cap) {
+  if (!flow) return { locationApplied: await applyPostcode(page, cap), storeUrl: "" };
+  const locationApplied = await applyPostcode(page, cap);
+  if (!locationApplied) return { locationApplied: false, storeUrl: "" };
+  await sleep(3500);
+
+  const storeRules = flow === "conad"
+    ? [{ href: "/ricerca-negozi/.+--[0-9]+" }]
+    : [
+        { href: "/it-it/negozi/[^?#]+", text: "scopri|dettagli|esselunga" },
+        { href: "/it-it/negozi/[^?#]+" }
+      ];
+  const storeUrl = await firstMatchingHref(page, storeRules);
+  if (!storeUrl) return { locationApplied, storeUrl: "" };
+  await page.goto(storeUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
+  await sleep(3500);
+  await clickConsent(page);
+
+  const offerRules = flow === "conad"
+    ? [
+        { href: "offert|volantin", text: "scopri tutte le offerte|volantin|offert" },
+        { href: "offert|volantin" }
+      ]
+    : [
+        { href: "/promozioni/volantini", text: "offert|promozion|volantin" },
+        { href: "/promozioni/volantini" }
+      ];
+  const offerUrl = await firstMatchingHref(page, offerRules);
+  if (offerUrl) {
+    await page.goto(offerUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
+    await sleep(4500);
+  }
+  return { locationApplied, storeUrl };
+}
+
 async function revealOffers(page) {
   for (let pass = 0; pass < 4; pass++) {
     await page.evaluate(() => {
@@ -183,7 +231,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 8 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 9 });
     let browser;
     try {
       const body = await request.json();
@@ -216,12 +264,12 @@ export default {
       await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 35000 });
       await sleep(adapter?.wait || 3500);
       await clickConsent(page);
-      const locationApplied = await applyPostcode(page, String(body.cap || ""));
+      const location = await resolveStoreOffers(page, adapter?.storeFlow, String(body.cap || ""));
       await revealOffers(page);
       const extracted = await extractOffers(page, String(body.query || ""), payloads);
       await browser.close();
       browser = undefined;
-      return json({ success: true, chainAdapter: Object.keys(ADAPTERS).find(root => requested.hostname.endsWith(root)) || "generic", locationApplied, ...extracted });
+      return json({ success: true, chainAdapter: Object.keys(ADAPTERS).find(root => requested.hostname.endsWith(root)) || "generic", locationApplied: location.locationApplied, storeUrl: location.storeUrl, ...extracted });
     } catch (error) {
       if (browser) await browser.close().catch(() => undefined);
       console.error(JSON.stringify({ event: "browser_adapter_error", message: String(error) }));
