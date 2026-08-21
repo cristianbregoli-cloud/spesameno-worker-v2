@@ -75,11 +75,172 @@ async function resolveEsselunga(cap, radiusKm = 10) {
   return {
     locationApplied: true,
     nearby: true,
+    storeAbbrev: String(store.abbrev).toUpperCase(),
     storeName: store.description || store.name || "Esselunga",
     storeAddress: [store.address, store.zipCode, store.city, store.province].filter(Boolean).join(", "),
     distanceKm: Number(store.distanceKm.toFixed(1)),
     storeUrl: targetUrl,
     targetUrl
+  };
+}
+
+function esselungaDigitalFlyers(html, baseUrl, storeAbbrev) {
+  const links = [];
+  const pattern = /href=["']([^"']*\/volantino-digitale\.[^"']*\.([a-z0-9]+)\.(\d+)\.html)["']/gi;
+  for (const match of html.matchAll(pattern)) {
+    if (match[2].toUpperCase() !== storeAbbrev) continue;
+    const url = new URL(match[1], baseUrl).href;
+    if (!links.some(link => link.promoCode === match[3])) links.push({ url, promoCode: match[3] });
+    if (links.length >= 8) break;
+  }
+  return links;
+}
+
+function formatEuro(value) {
+  return Number(value).toFixed(2).replace(".", ",");
+}
+
+function esselungaCategoryMatcher(query) {
+  const wanted = String(query || "").trim().toLowerCase();
+  const groups = [
+    [/^(frutta|verdura|ortofrutta|ortaggi)$/, /frutta|verdura/i],
+    [/^(carne|carni|pollame)$/, /^carne$/i],
+    [/^(pesce|sushi)$/, /^pesce/i],
+    [/^(latticini|latte|formaggi|formaggio|salumi|uova|yogurt)$/, /^latticini/i],
+    [/^(pane|panini|pasticceria)$/, /^pane e pasticceria/i],
+    [/^(pasta|riso|gnocchi)$/, /^(confezionati alimentari|gastronomia)/i],
+    [/^(acqua|birra|bibite|bevande)$/, /^acqua, birra/i],
+    [/^(vino|vini|liquori)$/, /^vini e liquori/i],
+    [/^(surgelati|gelati)$/, /^surgelati/i],
+    [/^(detersivi|detersivo|pulizia)$/, /^cura casa/i],
+    [/^(igiene|cosmetici)$/, /^igiene/i],
+    [/^(animali|cane|gatto)$/, /^amici animali/i]
+  ];
+  return groups.find(([pattern]) => pattern.test(wanted))?.[1] || null;
+}
+
+async function esselungaCategoryCodes(storeAbbrev, categoryMatcher) {
+  if (!categoryMatcher) return null;
+  const url = `https://www.esselunga.it/services/istituzionale35/digital-grid.condition:menu.abbrev:${encodeURIComponent(storeAbbrev)}.json`;
+  const response = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!response.ok) return null;
+  const menu = await response.json();
+  const byPromotion = new Map();
+  for (const promotion of Array.isArray(menu.categorie) ? menu.categorie : []) {
+    const promoCode = String(promotion.attributi?.codGruppoTestataPromo || "");
+    if (!promoCode) continue;
+    const codes = (Array.isArray(promotion.categorie) ? promotion.categorie : [])
+      .filter(category => categoryMatcher.test(String(category.nome || "")))
+      .map(category => String(category.attributi?.codCategoria1L || "").split(".")[0])
+      .filter(Boolean);
+    if (codes.length) byPromotion.set(promoCode, codes.join("|"));
+  }
+  return byPromotion;
+}
+
+function esselungaOffer(product, flyerUrl) {
+  const flyerFlags = Array.isArray(product.promozioni_flgVolantino) ? product.promozioni_flgVolantino : [];
+  const index = flyerFlags.findIndex(flag => flag === true);
+  if (index < 0) return null;
+  const promoPrices = Array.isArray(product.promozioni_prezzoPromo) ? product.promozioni_prezzoPromo : [];
+  const price = Number(promoPrices[index] ?? promoPrices[0]);
+  const title = String(product.title || "").trim();
+  if (!title || !Number.isFinite(price) || price <= 0) return null;
+
+  const advertisedUnits = Array.isArray(product.promozioni_prezzoPromoAl) ? product.promozioni_prezzoPromoAl : [];
+  const advertisedMeasures = Array.isArray(product.promozioni_misuraPrezzoPromoAl) ? product.promozioni_misuraPrezzoPromoAl : [];
+  let unitPrice = Number(advertisedUnits[index] ?? advertisedUnits[0] ?? 0);
+  let unitMeasure = String(advertisedMeasures[index] ?? advertisedMeasures[0] ?? product.misuraPrezzoAl ?? "").toUpperCase();
+  if (unitMeasure === "LT") unitMeasure = "L";
+  if ((!Number.isFinite(unitPrice) || unitPrice <= 0) && /\bal\s*kg\b/i.test(title)) {
+    unitPrice = price;
+    unitMeasure = "KG";
+  }
+  if ((!Number.isFinite(unitPrice) || unitPrice <= 0)) {
+    const weight = title.match(/\b(\d+(?:[,.]\d+)?)\s*(kg|g|l|ml)\b/i);
+    if (weight) {
+      const amount = Number(weight[1].replace(",", "."));
+      const measure = weight[2].toLowerCase();
+      const quantity = measure === "g" || measure === "ml" ? amount / 1000 : amount;
+      if (quantity > 0) {
+        unitPrice = price / quantity;
+        unitMeasure = measure === "l" || measure === "ml" ? "L" : "KG";
+      }
+    }
+  }
+  const unitText = Number.isFinite(unitPrice) && unitPrice > 0 && unitMeasure
+    ? `${formatEuro(unitPrice)} €/${unitMeasure.toLowerCase()}`
+    : "";
+  const mechanic = String(product.promozioni_desMeccanica?.[index] ?? product.promozioni_desMeccanica?.[0] ?? "Offerta volantino").trim();
+  return {
+    code: String(product.code || product.id || title),
+    text: [title, `${formatEuro(price)} €`, unitText, mechanic].filter(Boolean).join(" · "),
+    image: String(product.imgUrl || ""),
+    link: flyerUrl,
+    price,
+    unitPrice: Number.isFinite(unitPrice) && unitPrice > 0 ? Number(unitPrice.toFixed(2)) : undefined,
+    unitMeasure: unitMeasure || undefined
+  };
+}
+
+async function searchEsselungaFlyer(location, query) {
+  const response = await fetch(location.targetUrl, { headers: { Accept: "text/html" } });
+  if (!response.ok) throw new Error(`Volantino Esselunga ${response.status}`);
+  const html = await response.text();
+  if (html.length > 1500000) throw new Error("Volantino Esselunga troppo grande");
+  const flyers = esselungaDigitalFlyers(html, response.url || location.targetUrl, location.storeAbbrev);
+  if (!flyers.length) return { result: "", matches: 0, offers: [], finalUrl: response.url || location.targetUrl, pageTitle: "Volantini Esselunga", flyersChecked: 0 };
+
+  const cleanQuery = String(query || "").trim().slice(0, 100);
+  if (!cleanQuery) return { result: "", matches: 0, offers: [], finalUrl: response.url || location.targetUrl, pageTitle: "Volantini Esselunga", flyersChecked: flyers.length };
+  const categoryCodes = await esselungaCategoryCodes(location.storeAbbrev, esselungaCategoryMatcher(cleanQuery));
+
+  const readFlyer = async flyer => {
+    const categoryCode = categoryCodes?.get(flyer.promoCode);
+    if (categoryCodes && !categoryCode) return [];
+    const readPage = async page => {
+      const selectors = [
+        ["condition", "basic"],
+        ["abbrev", location.storeAbbrev],
+        ["codPromo", flyer.promoCode],
+        ["q", cleanQuery],
+        ["page", String(page)],
+        ["rows", "80"],
+        ...(categoryCode ? [["category", categoryCode]] : [])
+      ].map(([name, value]) => `.${name}:${encodeURIComponent(value)}`).join("");
+      const apiUrl = `https://www.esselunga.it/services/istituzionale35/digital-grid${selectors}.json`;
+      const apiResponse = await fetch(apiUrl, { headers: { Accept: "application/json", Referer: flyer.url } });
+      if (!apiResponse.ok) throw new Error(`Ricerca Esselunga ${apiResponse.status}`);
+      const payload = await apiResponse.json();
+      return { total: Number(payload.item_found || 0), items: Array.isArray(payload.items) ? payload.items : [] };
+    };
+    const first = await readPage(0);
+    const products = [...first.items];
+    if (first.total > first.items.length && first.items.length >= 80) {
+      const second = await readPage(1);
+      products.push(...second.items);
+    }
+    return products.map(product => esselungaOffer(product, flyer.url)).filter(Boolean);
+  };
+
+  const settled = await Promise.allSettled(flyers.map(readFlyer));
+  const successful = settled.filter(result => result.status === "fulfilled");
+  if (!successful.length) throw new Error("Ricerca offerte Esselunga non disponibile");
+  const byProduct = new Map();
+  for (const result of successful) {
+    for (const offer of result.value) {
+      const current = byProduct.get(offer.code);
+      if (!current || offer.price < current.price) byProduct.set(offer.code, offer);
+    }
+  }
+  const offers = [...byProduct.values()].sort((a, b) => a.price - b.price);
+  return {
+    result: offers.map(offer => `${offer.text}\n${offer.image}\n${offer.link}`).join("\n---\n"),
+    matches: offers.length,
+    offers,
+    finalUrl: response.url || location.targetUrl,
+    pageTitle: `Offerte volantino ${location.storeName}`,
+    flyersChecked: successful.length
   };
 }
 
@@ -296,7 +457,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 16 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 17 });
     let browser;
     try {
       const body = await request.json();
@@ -322,7 +483,18 @@ export default {
             pageTitle: ""
           });
         }
-        target = new URL(directLocation.targetUrl);
+        const extracted = await searchEsselungaFlyer(directLocation, String(body.query || ""));
+        return json({
+          success: true,
+          chainAdapter: "esselunga.it",
+          locationApplied: true,
+          nearbyStore: true,
+          storeName: directLocation.storeName,
+          storeAddress: directLocation.storeAddress,
+          distanceKm: directLocation.distanceKm,
+          storeUrl: directLocation.storeUrl,
+          ...extracted
+        });
       }
       if (adapter?.direct) {
         const response = await fetch(target.href, { headers: { "User-Agent": "Mozilla/5.0 (compatible; SpesaMeno/1.0)" } });
