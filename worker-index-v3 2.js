@@ -26,6 +26,7 @@ const ESSELUNGA_HERE_KEY = "p-Hih8fjYA1cSsL8gcVmnLj5U871xQ6uSQp4NJ0Ut8A";
 const ALDI_STORE_FINDER_KEY = "J8f9erNQcUhg1nmo5Bhp8wy2A6mQkK";
 
 const ADAPTERS = {
+  "iperal.it": { url: "https://www.iperal.it/promozioni/", storeFlow: "iperal" },
   "eurospin.it": { url: "https://www.eurospin.it/promozioni/", storeFlow: "eurospin" },
   "lidl.it": { url: "https://www.lidl.it/c/volantino-lidl/s10018048", storeFlow: "lidl" },
   "aldi.it": { url: "https://www.aldi.it/volantino-online", storeFlow: "aldi" },
@@ -132,12 +133,156 @@ async function resolveEurospin(cap, radiusKm = 10) {
   };
 }
 
+async function resolveIperal(cap, radiusKm = 10) {
+  const position = await geocodeItalianPostcode(cap);
+  if (!position) return { locationApplied: false, nearby: false };
+  const url = new URL("https://discover.search.hereapi.com/v1/discover");
+  url.searchParams.set("at", `${position.lat},${position.lng}`);
+  url.searchParams.set("q", "Iperal");
+  url.searchParams.set("limit", "16");
+  url.searchParams.set("lang", "it");
+  url.searchParams.set("apiKey", ESSELUNGA_HERE_KEY);
+  const response = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!response.ok) throw new Error(`Ricerca punti vendita Iperal ${response.status}`);
+  const payload = await response.json();
+  const store = (Array.isArray(payload?.items) ? payload.items : [])
+    .filter(item => /\biperal\b/i.test(String(item.title || "")) && item.position)
+    .map(item => ({ ...item, distanceKm: haversineKm(position, item.position) }))
+    .sort((a, b) => a.distanceKm - b.distanceKm)[0];
+  if (!store || store.distanceKm > radiusKm) {
+    return { locationApplied: true, nearby: false,
+      nearestDistanceKm: store ? Number(store.distanceKm.toFixed(1)) : null };
+  }
+  const address = store.address || {};
+  return {
+    locationApplied: true, nearby: true, storeId: String(store.id || ""),
+    storeName: `Iperal ${address.city || address.district || cap}`,
+    storeAddress: String(address.label || "").replace(/^IPERAL,\s*/i, ""),
+    city: String(address.city || address.district || ""),
+    county: String(address.county || ""),
+    distanceKm: Number(store.distanceKm.toFixed(1)),
+    storeUrl: "https://www.iperal.it/punti-vendita/",
+    targetUrl: "https://www.iperal.it/promozioni/"
+  };
+}
+
+function iperalProductCards(html) {
+  return [...html.matchAll(/<div\b[^>]*class=["'][^"']*card_footer[^"']*["'][\s\S]*?<\/p>/gi)]
+    .map(match => {
+      const card = match[0];
+      return {
+        title: decodeLidlHtml(card.match(/<strong>([\s\S]*?)<\/strong>/i)?.[1]).replace(/\s+/g, " "),
+        weight: decodeLidlHtml(card.match(/<span>([\s\S]*?)<\/span>/i)?.[1]).replace(/\s+/g, " "),
+        image: decodeLidlHtml(card.match(/<img\b[^>]*\bdata-src=["']([^"']+)/i)?.[1]
+          || card.match(/<img\b[^>]*\bsrc=["']([^"']+)/i)?.[1])
+      };
+    }).filter(card => card.title);
+}
+
+function iperalEnrichOffer(offer, cards, viewerUrl, query) {
+  if (normalizeProductSearch(query) === "pasta" && /\bpasta\s+(?:gialla|bianca)\b/i.test(offer.name)) return null;
+  if (/^(frutta|verdura|verdure|ortaggi|ortofrutta|carne|carni|pollame|pesce|pesci|latticini|formaggi|formaggio|bevande|bibite)$/.test(normalizeProductSearch(query))
+      && !eurospinProductMatches(offer.name, "", query)) return null;
+  const offerName = normalizeProductSearch(offer.name);
+  const terms = offerName.split(/\s+/).filter(term => term.length > 3);
+  const card = cards.map(item => {
+    const title = normalizeProductSearch(item.title);
+    const common = terms.filter(term => title.includes(term)).length;
+    return { item, score: common / Math.max(title.split(/\s+/).filter(term => term.length > 3).length, 1), common };
+  }).filter(item => item.common && item.score >= 0.5)
+    .sort((a, b) => b.common - a.common || b.score - a.score)[0]?.item;
+  const information = `${offer.name} ${card?.weight || ""}`;
+  const forward = information.match(/(?:^|\s)(kg|g|ml|cl|l|lt)\s*(\d+(?:[.,]\d+)?)(?:\s*[x×]\s*(\d+))?\b/i);
+  const reverse = information.match(/(?:(\d+)\s*[x×]\s*)?(\d+(?:[.,]\d+)?)\s*(kg|g|ml|cl|l|lt)\b/i);
+  const measure = String(forward?.[1] || reverse?.[3] || "").toLowerCase();
+  const amount = Number(String(forward?.[2] || reverse?.[2] || 0).replace(",", "."));
+  const count = Number(forward?.[3] || reverse?.[1] || 1);
+  const quantity = amount * count / (measure === "g" || measure === "ml" ? 1000 : measure === "cl" ? 100 : 1);
+  const unitMeasure = /^(ml|cl|l|lt)$/.test(measure) ? "L" : measure ? "KG" : undefined;
+  const unitPrice = quantity > 0 ? Number((offer.price / quantity).toFixed(2)) : undefined;
+  const unitLabel = unitPrice && unitMeasure ? `€/${unitMeasure.toLowerCase()}` : undefined;
+  return {
+    ...offer, code: offer.code.replace(/^conad-pdf-/, "iperal-pdf-"),
+    text: [offer.name, `${formatEuro(offer.price)} €`, unitPrice ? `${formatEuro(unitPrice)} ${unitLabel}` : ""]
+      .filter(Boolean).join(" · "),
+    image: card?.image || "", link: viewerUrl, unitPrice, unitMeasure, unitLabel
+  };
+}
+
+async function searchIperalOffers(location, query) {
+  const promotionsResponse = await fetch(location.targetUrl, {
+    headers: { Accept: "text/html" }, cf: { cacheTtl: 900, cacheEverything: true }
+  });
+  if (!promotionsResponse.ok) throw new Error(`Promozioni Iperal ${promotionsResponse.status}`);
+  const promotions = await promotionsResponse.text();
+  const viewers = [...new Set([...promotions.matchAll(/https:\/\/iperal\.volantinopiu\.com\/volantino\d+\.html/g)]
+    .map(match => match[0]))];
+  if (!viewers.length) throw new Error("Volantino ufficiale Iperal non disponibile");
+  const place = normalizeProductSearch(`${location.city} ${location.county} ${location.storeName}`);
+  const mountain = /\b(adamello|darfo|breno|esine|sonico|casnigo|clusone|costa volpino|vertova|sondrio|bianzone|carlazzo|dongo|morbegno|rogolo|sondalo|brescia)\b/.test(place);
+  const milan = /\b(milano|milano citta)\b/.test(place);
+  const preferred = mountain ? "valtellina" : milan ? "milano" : "brianza";
+  let selected;
+  for (const viewerUrl of viewers.slice(0, 5)) {
+    const response = await fetch(viewerUrl, {
+      headers: { Accept: "text/html" }, cf: { cacheTtl: 900, cacheEverything: true }
+    });
+    if (!response.ok) continue;
+    const html = await response.text();
+    const title = decodeLidlHtml(html.match(/<title>([\s\S]*?)<\/title>/i)?.[1]);
+    if (!normalizeProductSearch(title).includes(preferred)) continue;
+    const pdfUrl = decodeLidlHtml(html.match(/href=["'](https:\/\/resourcespiu\.volantinopiu\.it\/flyer\/[^"']+\.pdf)["']/i)?.[1]);
+    if (!pdfUrl || new URL(pdfUrl).hostname !== "resourcespiu.volantinopiu.it") continue;
+    selected = { viewerUrl, title, html, pdfUrl };
+    break;
+  }
+  if (!selected) throw new Error(`Volantino Iperal ${preferred} non disponibile`);
+  const cleanQuery = String(query || "").trim().slice(0, 100);
+  let extracted = cleanQuery ? await searchConadPdfFlyer(selected.pdfUrl, cleanQuery)
+    : { offers: [], pagesChecked: 0, totalPages: 0 };
+  const cards = iperalProductCards(selected.html);
+  let sharedCampaign = false;
+  if (cleanQuery && !extracted.offers.length && preferred !== "valtellina") {
+    for (const viewerUrl of viewers.slice(0, 5)) {
+      if (viewerUrl === selected.viewerUrl) continue;
+      const response = await fetch(viewerUrl, { headers: { Accept: "text/html" },
+        cf: { cacheTtl: 900, cacheEverything: true } });
+      if (!response.ok) continue;
+      const html = await response.text();
+      const title = decodeLidlHtml(html.match(/<title>([\s\S]*?)<\/title>/i)?.[1]);
+      if (!normalizeProductSearch(title).includes("valtellina")) continue;
+      const sameCampaign = normalizeProductSearch(title.split("|").slice(1).join("|"))
+        === normalizeProductSearch(selected.title.split("|").slice(1).join("|"));
+      const referenceCards = iperalProductCards(html);
+      const sameProducts = cards.length > 0 && cards.length === referenceCards.length
+        && cards.every((card, index) => normalizeProductSearch(card.title)
+          === normalizeProductSearch(referenceCards[index].title));
+      if (!sameCampaign || !sameProducts) break;
+      const pdfUrl = decodeLidlHtml(html.match(/href=["'](https:\/\/resourcespiu\.volantinopiu\.it\/flyer\/[^"']+\.pdf)["']/i)?.[1]);
+      if (!pdfUrl || new URL(pdfUrl).hostname !== "resourcespiu.volantinopiu.it") break;
+      extracted = await searchConadPdfFlyer(pdfUrl, cleanQuery);
+      sharedCampaign = true;
+      break;
+    }
+  }
+  const offers = extracted.offers.map(offer => iperalEnrichOffer(offer, cards, selected.viewerUrl, cleanQuery))
+    .filter(offer => !sharedCampaign || Boolean(offer?.image))
+    .filter(Boolean).sort((a, b) => a.price - b.price);
+  return {
+    result: offers.map(offer => `${offer.text}\n${offer.image}\n${offer.link}`).join("\n---\n"),
+    matches: offers.length, offers, finalUrl: selected.viewerUrl,
+    pageTitle: `Offerte volantino ${location.storeName} · ${selected.title}`,
+    flyersChecked: 1, flyerProducts: cards.length, pdfPagesChecked: extracted.pagesChecked,
+    flyerEdition: preferred, sourceFormat: sharedCampaign ? "iperal-official-shared-campaign" : "iperal-official-pdf"
+  };
+}
+
 function eurospinProductMatches(name, brand, query) {
   const wanted = normalizeProductSearch(query).trim();
   const haystack = normalizeProductSearch(`${name} ${brand}`);
   if (!wanted) return false;
   const groups = [
-    [/^frutta$/, /\b(?:mel[ae]|per[ae]|pesche|uva|banan[ae]|albicocc[ah]|susin[ae]|prugn[ae]|meloni?|anguri[ae]|fragol[ae]|kiwi|frutta fresca)\b/],
+    [/^frutta$/, /\b(?:mel[ae]|per[ae]|pesche|nettari(?:na|ne)|uva|banan[ae]|albicocc[ah]|susin[ae]|prugn[ae]|meloni?|anguri[ae]|fragol[ae]|kiwi|aranc[ei]|frutta fresca)\b/],
     [/^(verdura|verdure|ortaggi|ortofrutta)$/, /\b(?:patat[ae]|pomodor[io]|carot[ae]|zucchin[ae]|peperon[ei]|melanzan[ae]|insalat[ae]|cipoll[ae]|verdure?|ortaggi)\b/],
     [/^(carne|carni|pollame)$/, /\b(?:carne|pollo|tacchino|suino|manzo|salsiccia|hamburger|cotolett[ae])\b/],
     [/^(pesce|pesci)$/, /\b(?:pesce|tonno|salmone|merluzzo|orata|branzino|gamber[io])\b/],
@@ -679,7 +824,7 @@ async function resolveConad(cap, radiusKm = 10) {
 }
 
 const CONAD_PDF_NUMBER = "-?(?:\\d+\\.?\\d*|\\.\\d+)";
-const CONAD_PDF_OPERATOR = new RegExp(`(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+Tm|(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+Td|(\\[(?:[^\\]\\\\]|\\\\[\\s\\S])*\\])\\s*TJ|(\\((?:[^()\\\\]|\\\\[\\s\\S])*\\))\\s*Tj`, "g");
+const CONAD_PDF_OPERATOR = new RegExp(`(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+Tm|(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+Td|(\\[(?:[^\\]\\\\]|\\\\[\\s\\S])*\\])\\s*TJ|(\\((?:[^()\\\\]|\\\\[\\s\\S])*\\))\\s*Tj|\\/[\\w-]+\\s+(${CONAD_PDF_NUMBER})\\s+Tf`, "g");
 const CONAD_CATEGORY_WORDS = {
   frutta: ["frutt", "mela", "mele", "pera", "pere", "pesc", "nettari", "susin", "uva", "angur", "melon", "frag", "mirtil", "banana", "albicocc", "kiwi", "avocado", "ananas", "aranc", "limon"],
   verdura: ["verdur", "ortofrutt", "patat", "pomodor", "peperon", "cetriol", "lattug", "insalat", "zucchin", "melanzan", "carot", "cipoll", "fagiolin", "spinac", "finocch"],
@@ -701,9 +846,13 @@ function conadPdfString(value) {
 }
 
 function conadPdfRuns(content) {
-  let x = 0, y = 0, scaleX = 1, scaleY = 1;
+  let x = 0, y = 0, scaleX = 1, scaleY = 1, fontSize = 1;
   const runs = [];
   for (const item of content.matchAll(CONAD_PDF_OPERATOR)) {
+    if (item[11] !== undefined) {
+      fontSize = Number(item[11]) || 1;
+      continue;
+    }
     if (item[1] !== undefined) {
       scaleX = Number(item[1]); scaleY = Number(item[4]); x = Number(item[5]); y = Number(item[6]);
       continue;
@@ -715,7 +864,7 @@ function conadPdfRuns(content) {
     const parts = item[9] ? [...item[9].matchAll(/\(((?:[^()\\]|\\[\s\S])*)\)/g)].map(part => part[1])
       : [item[10].slice(1, -1)];
     const text = conadPdfString(parts.join(""));
-    if (text) runs.push({ x, y, size: Math.abs(scaleY), text });
+    if (text) runs.push({ x, y, size: Math.abs(scaleY) * fontSize, text });
     if (runs.length >= 2500) break;
   }
   return runs;
@@ -747,8 +896,16 @@ function conadMoneyRuns(runs) {
     }
     if (!/^\d{1,3}$/.test(run.text) || run.size < 25) continue;
     const cents = runs.find(other => /^,\d{2}$/.test(other.text)
-      && Math.abs(other.y - run.y) <= 3 && other.x > run.x && other.x - run.x <= 140);
-    if (cents) prices.push({ ...run, price: Number(`${run.text}.${cents.text.slice(1)}`) });
+      && Math.abs(other.y - run.y) <= 35 && other.x > run.x && other.x - run.x <= 140);
+    if (cents) {
+      prices.push({ ...run, price: Number(`${run.text}.${cents.text.slice(1)}`) });
+      continue;
+    }
+    const comma = runs.find(other => other.text === "," && Math.abs(other.y - run.y) <= 35
+      && other.x > run.x && other.x - run.x <= 140);
+    const splitCents = comma && runs.find(other => /^\d{2}$/.test(other.text)
+      && Math.abs(other.y - comma.y) <= 3 && other.x > comma.x && other.x - comma.x <= 30);
+    if (splitCents) prices.push({ ...run, price: Number(`${run.text}.${splitCents.text}`) });
   }
   return prices.filter((price, index) => price.price > 0 && price.price < 1000
     && prices.findIndex(other => other.price === price.price
@@ -817,10 +974,37 @@ async function searchConadPdfFlyer(pdfUrl, query) {
   if (buffer.length > 30000000) throw new Error("Volantino Conad troppo grande");
   const raw = new TextDecoder("latin1").decode(buffer);
   const objects = new Map();
-  const pages = [];
   for (const object of raw.matchAll(/(?:^|[\r\n])(\d+)\s+\d+\s+obj\b([\s\S]*?)\bendobj\b/g)) {
     const body = object[2];
     objects.set(object[1], { body, offset: object.index + object[0].indexOf(body) });
+  }
+  for (const object of [...objects.values()]) {
+    const marker = object.body.indexOf("stream");
+    const header = object.body.slice(0, marker < 0 ? 3000 : marker);
+    if (marker < 0 || !/\/Type\s*\/ObjStm\b/.test(header)) continue;
+    let start = object.offset + marker + 6;
+    if (buffer[start] === 13) start++;
+    if (buffer[start] === 10) start++;
+    const length = Number(header.match(/\/Length\s+(\d+)/)?.[1] || 0);
+    const first = Number(header.match(/\/First\s+(\d+)/)?.[1] || 0);
+    const count = Number(header.match(/\/N\s+(\d+)/)?.[1] || 0);
+    if (!length || !first || !count || length > 2000000 || count > 1000) continue;
+    try {
+      const bytes = /\/FlateDecode/.test(header) ? inflateSync(buffer.subarray(start, start + length))
+        : buffer.subarray(start, start + length);
+      if (bytes.length > 4000000 || first > bytes.length) continue;
+      const decoded = new TextDecoder("latin1").decode(bytes);
+      const pairs = [...decoded.slice(0, first).matchAll(/(\d+)\s+(\d+)/g)].slice(0, count);
+      for (let index = 0; index < pairs.length; index++) {
+        const from = first + Number(pairs[index][2]);
+        const to = index + 1 < pairs.length ? first + Number(pairs[index + 1][2]) : decoded.length;
+        objects.set(pairs[index][1], { body: decoded.slice(from, to), offset: -1 });
+      }
+    } catch { continue; }
+  }
+  const pages = [];
+  for (const object of objects.values()) {
+    const body = object.body;
     const header = body.slice(0, body.indexOf("stream") < 0 ? 3000 : body.indexOf("stream"));
     if (!/\/Type\s*\/Page\b/.test(header)) continue;
     const refs = header.match(/\/Contents\s*\[([^\]]+)\]/)?.[1] || header.match(/\/Contents\s+(\d+\s+\d+\s+R)/)?.[1] || "";
@@ -838,7 +1022,10 @@ async function searchConadPdfFlyer(pdfUrl, query) {
       let start = object.offset + marker + 6;
       if (buffer[start] === 13) start++;
       if (buffer[start] === 10) start++;
-      const length = Number(header.match(/\/Length\s+(\d+)(?!\s+\d+\s+R)/)?.[1] || 0);
+      const reference = header.match(/\/Length\s+(\d+)(?:\s+(\d+)\s+R)?/);
+      const length = reference?.[2]
+        ? Number(objects.get(reference[1])?.body.match(/^\s*(\d+)/)?.[1] || 0)
+        : Number(reference?.[1] || 0);
       const end = length ? start + length : raw.indexOf("endstream", start);
       if (end <= start || end - start > 600000) continue;
       try {
@@ -1334,7 +1521,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 23 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 24 });
     let browser;
     try {
       const body = await request.json();
@@ -1343,6 +1530,19 @@ export default {
       const adapter = adapterFor(requested.hostname);
       let target = new URL(adapter?.url || requested.href);
       let directLocation = null;
+      if (adapter?.storeFlow === "iperal") {
+        const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
+        directLocation = await resolveIperal(String(body.cap || ""), radius);
+        if (!directLocation.nearby) {
+          return json({ success: true, chainAdapter: "iperal.it", locationApplied: directLocation.locationApplied,
+            nearbyStore: false, nearestDistanceKm: directLocation.nearestDistanceKm ?? null,
+            result: "", matches: 0, offers: [], finalUrl: adapter.url, pageTitle: "" });
+        }
+        const extracted = await searchIperalOffers(directLocation, String(body.query || "").slice(0, 100));
+        return json({ success: true, chainAdapter: "iperal.it", locationApplied: true, nearbyStore: true,
+          storeName: directLocation.storeName, storeAddress: directLocation.storeAddress,
+          distanceKm: directLocation.distanceKm, storeUrl: directLocation.storeUrl, ...extracted });
+      }
       if (adapter?.storeFlow === "eurospin") {
         const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
         directLocation = await resolveEurospin(String(body.cap || ""), radius);
