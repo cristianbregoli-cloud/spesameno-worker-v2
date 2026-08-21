@@ -18,6 +18,9 @@ const json = (value, status = 200) => Response.json(value, {
 });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const allowedHost = host => ROOT_HOSTS.some(root => host === root || host.endsWith(`.${root}`));
+const ESSELUNGA_STORES_URL = "https://www.esselunga.it/services/istituzionale35/all-stores.json";
+// Public browser key published by Esselunga on its store-locator page.
+const ESSELUNGA_HERE_KEY = "p-Hih8fjYA1cSsL8gcVmnLj5U871xQ6uSQp4NJ0Ut8A";
 
 const ADAPTERS = {
   "aldi.it": { url: "https://www.aldi.it/speciali-della-settimana", wait: 6000 },
@@ -31,6 +34,53 @@ const ADAPTERS = {
 
 function adapterFor(host) {
   return Object.entries(ADAPTERS).find(([root]) => host === root || host.endsWith(`.${root}`))?.[1];
+}
+
+function haversineKm(a, b) {
+  const radians = degrees => degrees * Math.PI / 180;
+  const dLat = radians(b.lat - a.lat);
+  const dLon = radians(b.lng - a.lng);
+  const lat1 = radians(a.lat);
+  const lat2 = radians(b.lat);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+async function resolveEsselunga(cap, radiusKm = 10) {
+  if (!/^\d{5}$/.test(cap)) return { locationApplied: false, storeUrl: "", targetUrl: "", nearby: false };
+  const geocodeUrl = new URL("https://geocode.search.hereapi.com/v1/geocode");
+  geocodeUrl.searchParams.set("q", `${cap} Italia`);
+  geocodeUrl.searchParams.set("in", "countryCode:ITA");
+  geocodeUrl.searchParams.set("lang", "it");
+  geocodeUrl.searchParams.set("apiKey", ESSELUNGA_HERE_KEY);
+  const [geocodeResponse, storesResponse] = await Promise.all([
+    fetch(geocodeUrl, { headers: { Accept: "application/json" } }),
+    fetch(ESSELUNGA_STORES_URL, { headers: { Accept: "application/json" } })
+  ]);
+  if (!geocodeResponse.ok || !storesResponse.ok) throw new Error("Servizio punti vendita Esselunga non disponibile");
+  const [geocode, storePayload] = await Promise.all([geocodeResponse.json(), storesResponse.json()]);
+  const position = geocode?.items?.find(item => item?.position)?.position;
+  if (!position) return { locationApplied: false, storeUrl: "", targetUrl: "", nearby: false };
+  const stores = Array.isArray(storePayload?.stores) ? storePayload.stores : [];
+  const ranked = stores
+    .filter(store => Number.isFinite(Number(store.latitude)) && Number.isFinite(Number(store.longitude)) && store.abbrev)
+    .map(store => ({ ...store, distanceKm: haversineKm(position, { lat: Number(store.latitude), lng: Number(store.longitude) }) }))
+    .sort((a, b) => a.distanceKm - b.distanceKm);
+  const store = ranked[0];
+  if (!store || store.distanceKm > radiusKm) {
+    return { locationApplied: true, storeUrl: "", targetUrl: "", nearby: false, nearestDistanceKm: store ? Number(store.distanceKm.toFixed(1)) : null };
+  }
+  const abbrev = encodeURIComponent(String(store.abbrev).toLowerCase());
+  const targetUrl = `https://www.esselunga.it/it-it/promozioni/volantini.${abbrev}.html`;
+  return {
+    locationApplied: true,
+    nearby: true,
+    storeName: store.description || store.name || "Esselunga",
+    storeAddress: [store.address, store.zipCode, store.city, store.province].filter(Boolean).join(", "),
+    distanceKm: Number(store.distanceKm.toFixed(1)),
+    storeUrl: targetUrl,
+    targetUrl
+  };
 }
 
 function decodeHtml(value) {
@@ -246,14 +296,34 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 14 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 15 });
     let browser;
     try {
       const body = await request.json();
       const requested = new URL(body.url);
       if (requested.protocol !== "https:" || !allowedHost(requested.hostname)) return json({ error: "Sito non autorizzato" }, 403);
       const adapter = adapterFor(requested.hostname);
-      const target = new URL(adapter?.url || requested.href);
+      let target = new URL(adapter?.url || requested.href);
+      let directLocation = null;
+      if (adapter?.storeFlow === "esselunga") {
+        const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
+        directLocation = await resolveEsselunga(String(body.cap || ""), radius);
+        if (!directLocation.targetUrl) {
+          return json({
+            success: true,
+            chainAdapter: "esselunga.it",
+            locationApplied: directLocation.locationApplied,
+            nearbyStore: false,
+            nearestDistanceKm: directLocation.nearestDistanceKm ?? null,
+            result: "",
+            matches: 0,
+            offers: [],
+            finalUrl: adapter.url,
+            pageTitle: ""
+          });
+        }
+        target = new URL(directLocation.targetUrl);
+      }
       if (adapter?.direct) {
         const response = await fetch(target.href, { headers: { "User-Agent": "Mozilla/5.0 (compatible; SpesaMeno/1.0)" } });
         if (!response.ok) throw new Error(`Fonte ${response.status}`);
@@ -264,14 +334,18 @@ export default {
       browser = await launchBrowser(env.BROWSER);
       const page = await browser.newPage();
       const payloads = [];
+      let payloadBytes = 0;
       page.on("response", async response => {
         try {
           const type = (response.headers()["content-type"] || "").toLowerCase();
           const url = response.url().toLowerCase();
-          if (!/(json|javascript|text\/plain|text\/html)/.test(type) && !/(api|product|promo|offer|volantin|leaflet|flyer|catalog)/.test(url)) return;
+          if (!/(json|text\/plain)/.test(type) && !/(api|product|promo|offer|volantin|leaflet|flyer|catalog)/.test(url)) return;
+          if (payloadBytes >= 700000) return;
           const text = await response.text();
-          const used = payloads.reduce((sum, item) => sum + item.length, 0);
-          if (text && text.length < 900000 && used + text.length < 4500000) payloads.push(text);
+          if (text && text.length < 350000 && payloadBytes + text.length < 700000) {
+            payloads.push(text);
+            payloadBytes += text.length;
+          }
         } catch { /* opaque or streaming response */ }
       });
       await page.setUserAgent("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1");
@@ -279,12 +353,22 @@ export default {
       await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 35000 });
       await sleep(adapter?.wait || 3500);
       await clickConsent(page);
-      const location = await resolveStoreOffers(page, adapter?.storeFlow, String(body.cap || ""));
+      const location = directLocation || await resolveStoreOffers(page, adapter?.storeFlow, String(body.cap || ""));
       await revealOffers(page);
       const extracted = await extractOffers(page, String(body.query || ""), payloads);
       await browser.close();
       browser = undefined;
-      return json({ success: true, chainAdapter: Object.keys(ADAPTERS).find(root => requested.hostname.endsWith(root)) || "generic", locationApplied: location.locationApplied, storeUrl: location.storeUrl, ...extracted });
+      return json({
+        success: true,
+        chainAdapter: Object.keys(ADAPTERS).find(root => requested.hostname.endsWith(root)) || "generic",
+        locationApplied: location.locationApplied,
+        nearbyStore: location.nearby ?? undefined,
+        storeName: location.storeName || undefined,
+        storeAddress: location.storeAddress || undefined,
+        distanceKm: location.distanceKm ?? undefined,
+        storeUrl: location.storeUrl,
+        ...extracted
+      });
     } catch (error) {
       if (browser) await browser.close().catch(() => undefined);
       console.error(JSON.stringify({ event: "browser_adapter_error", message: String(error) }));
