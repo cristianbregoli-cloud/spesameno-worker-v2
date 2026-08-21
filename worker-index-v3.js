@@ -21,9 +21,11 @@ const allowedHost = host => ROOT_HOSTS.some(root => host === root || host.endsWi
 const ESSELUNGA_STORES_URL = "https://www.esselunga.it/services/istituzionale35/all-stores.json";
 // Public browser key published by Esselunga on its store-locator page.
 const ESSELUNGA_HERE_KEY = "p-Hih8fjYA1cSsL8gcVmnLj5U871xQ6uSQp4NJ0Ut8A";
+// Public store-finder identifier published on Aldi's official Italian website.
+const ALDI_STORE_FINDER_KEY = "J8f9erNQcUhg1nmo5Bhp8wy2A6mQkK";
 
 const ADAPTERS = {
-  "aldi.it": { url: "https://www.aldi.it/offerte-settimanali/offerte-di-questa-settimana", wait: 6000 },
+  "aldi.it": { url: "https://www.aldi.it/volantino-online", storeFlow: "aldi" },
   "mdspa.it": { url: "https://www.mdspa.it/volantino", storeFlow: "md" },
   "esselunga.it": { url: "https://www.esselunga.it/it-it/negozi.html", wait: 5000, storeFlow: "esselunga" },
   "carrefour.it": { url: "https://www.carrefour.it/volantino", wait: 5000 },
@@ -152,7 +154,7 @@ function mdOffer(product, flyerUrl) {
   return {
     code: String(product.idProduct || product.code || name),
     text: [name, weightText, `${formatEuro(price)} €`, unitText, "Offerta volantino"].filter(Boolean).join(" · "),
-    image: imagePath ? new URL(imagePath, "https://service-volantino.mdspa.it").href : "",
+    image: imagePath ? new URL(imagePath, "https://volantino.mdspa.it").href : "",
     link: flyerUrl,
     price,
     unitPrice,
@@ -168,8 +170,13 @@ async function searchMdFlyer(location, query) {
   const flyerCode = localHtml.match(/data-flyer-code=["']([a-z0-9_-]+)["']/i)?.[1];
   if (!flyerCode) throw new Error("Codice volantino locale MD non disponibile");
 
-  const flyerUrl = `https://service-volantino.mdspa.it/${encodeURIComponent(flyerCode)}`;
-  const response = await fetch(flyerUrl, { headers: { Accept: "text/html" } });
+  // The service-volantino gateway redirects to this canonical HTML document.
+  // Calling the gateway from Workers intermittently returns 502, while the
+  // official destination consistently exposes the same local product feed.
+  const flyerUrl = `https://volantino.mdspa.it/${encodeURIComponent(flyerCode)}.html`;
+  const response = await fetch(flyerUrl, {
+    headers: { Accept: "text/html,application/xhtml+xml", Referer: "https://www.mdspa.it/" }
+  });
   if (!response.ok) throw new Error(`Catalogo offerte MD ${response.status}`);
   const html = await response.text();
   if (html.length > 5000000) throw new Error("Catalogo offerte MD troppo grande");
@@ -195,6 +202,127 @@ async function searchMdFlyer(location, query) {
     flyersChecked: 1,
     flyerValidity: location.validity,
     flyerProducts: products.length
+  };
+}
+
+async function resolveAldi(cap, radiusKm = 10) {
+  const position = await geocodeItalianPostcode(cap);
+  if (!position) return { locationApplied: false, nearby: false };
+  const url = new URL(`https://locator.uberall.com/api/storefinders/${ALDI_STORE_FINDER_KEY}/locations`);
+  url.searchParams.set("lat", String(position.lat));
+  url.searchParams.set("lng", String(position.lng));
+  url.searchParams.set("max", "20");
+  const response = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!response.ok) throw new Error(`Ricerca punti vendita ALDI ${response.status}`);
+  const payload = await response.json();
+  const stores = Array.isArray(payload?.response?.locations) ? payload.response.locations : [];
+  const ranked = stores.filter(store => Number.isFinite(Number(store.lat)) && Number.isFinite(Number(store.lng)))
+    .map(store => ({ ...store, distanceKm: haversineKm(position, { lat: Number(store.lat), lng: Number(store.lng) }) }))
+    .sort((a, b) => a.distanceKm - b.distanceKm);
+  const store = ranked[0];
+  if (!store || store.distanceKm > radiusKm) {
+    return { locationApplied: true, nearby: false, nearestDistanceKm: store ? Number(store.distanceKm.toFixed(1)) : null };
+  }
+  return {
+    locationApplied: true,
+    nearby: true,
+    storeId: String(store.identifier || store.id),
+    storeName: String(store.name || "ALDI"),
+    storeAddress: [store.streetAndNumber, store.zip, store.city].filter(Boolean).join(", "),
+    distanceKm: Number(store.distanceKm.toFixed(1)),
+    storeUrl: "https://www.aldi.it/punti-vendita-e-orari-di-apertura"
+  };
+}
+
+function aldiVerifiedOffer(contents, query, pageUrl, pageNumber) {
+  // Aldi's search index contains complete page text, including ordinary
+  // assortment pages. Never mistake the latter for promotional offers.
+  if (!/(?:-\s*\d{1,2}\s*%|quantit[àa]\s+limitata|offert)/i.test(contents)) return null;
+  const wanted = normalizeProductSearch(query).trim();
+  const stems = wanted.split(/\s+/).filter(word => word.length > 2)
+    .map(word => word.length > 4 ? word.slice(0, -1) : word);
+  const normalized = normalizeProductSearch(contents);
+  const position = normalized.indexOf(stems[0] || "");
+  if (position < 0 || !stems.every(stem => normalized.includes(stem))) return null;
+
+  const units = [...contents.matchAll(/(?:€|¤)\s*(\d+[,.]\d{2})\s*\/\s*(kg|litro|l)\b/gi)]
+    .map(match => ({ value: Number(match[1].replace(",", ".")), measure: /^kg$/i.test(match[2]) ? "KG" : "L", index: match.index }));
+  const quantities = [...contents.matchAll(/\b(\d+(?:[,.]\d+)?)\s*(kg|g|ml|l)\b/gi)]
+    .map(match => {
+      const value = Number(match[1].replace(",", "."));
+      const measure = match[2].toLowerCase();
+      return { value: measure === "g" || measure === "ml" ? value / 1000 : value,
+        label: `${match[1]} ${measure}`, measure: measure === "ml" || measure === "l" ? "L" : "KG", index: match.index };
+    });
+  const prices = [...contents.matchAll(/\b(\d+[,.]\d{2})\b/g)]
+    .map(match => ({ value: Number(match[1].replace(",", ".")), index: match.index }))
+    .filter(price => !units.some(unit => Math.abs(unit.index - price.index) < 4));
+  const candidates = [];
+  for (const quantity of quantities) {
+    for (const unit of units) {
+      if (quantity.measure !== unit.measure) continue;
+      const expected = Number((quantity.value * unit.value).toFixed(2));
+      for (const price of prices) {
+        if (Math.abs(price.value - expected) > 0.005 || price.value <= 0) continue;
+        const score = Math.abs(quantity.index - position) * 2 + Math.abs(unit.index - position)
+          + Math.abs(price.index - position);
+        candidates.push({ price: price.value, unitPrice: unit.value, quantity, unit, score });
+      }
+    }
+  }
+  const candidate = candidates.sort((a, b) => a.score - b.score)[0];
+  // A price is published only when the official page independently confirms it
+  // through price = quantity × €/kg (or €/l).
+  if (!candidate) return null;
+  const escaped = stems[0].toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const titleMatch = contents.match(new RegExp(`(?:[A-ZÀ-Ü΄']{1,20}\\s+){0,4}[A-ZÀ-Ü]*${escaped}[A-ZÀ-Ü]*(?:\\s+[A-ZÀ-Ü΄']{2,20})?`));
+  const title = String(titleMatch?.[0] || query).trim().replace(/\s+/g, " ");
+  const unitText = `${formatEuro(candidate.unitPrice)} €/${candidate.unit.measure.toLowerCase()}`;
+  return {
+    code: `aldi-${pageNumber}-${normalizeProductSearch(title).replace(/\W+/g, "-")}`,
+    text: [title, candidate.quantity.label, `${formatEuro(candidate.price)} €`, unitText, "Offerta volantino"].join(" · "),
+    image: "",
+    link: pageUrl,
+    price: candidate.price,
+    unitPrice: candidate.unitPrice,
+    unitMeasure: candidate.unit.measure
+  };
+}
+
+async function searchAldiFlyer(location, query) {
+  const listingResponse = await fetch("https://www.aldi.it/volantino-online", { headers: { Accept: "text/html" } });
+  if (!listingResponse.ok) throw new Error(`Volantini ALDI ${listingResponse.status}`);
+  const listing = await listingResponse.text();
+  if (listing.length > 1800000) throw new Error("Elenco volantini ALDI troppo grande");
+  const links = [...new Set([...listing.matchAll(/https:\/\/volantino\.aldi\.it\/([^"'\s<>]+)\/page\/1/gi)]
+    .map(match => match[1]).filter(slug => /offert/i.test(slug)))].slice(0, 2);
+  if (!links.length) return { result: "", matches: 0, offers: [], finalUrl: "https://www.aldi.it/volantino-online", flyersChecked: 0 };
+  const cleanQuery = String(query || "").trim().slice(0, 100);
+  if (!cleanQuery) return { result: "", matches: 0, offers: [], finalUrl: "https://www.aldi.it/volantino-online", flyersChecked: links.length };
+  // The official listing shows the currently valid flyer before future flyers.
+  const slug = links[0];
+  const searchUrl = new URL(`https://volantino.aldi.it/${slug}/search.json`);
+  searchUrl.searchParams.set("q", cleanQuery);
+  searchUrl.searchParams.set("sort", "_score desc");
+  searchUrl.searchParams.set("return", "contents,_score,page_number");
+  const response = await fetch(searchUrl, { headers: { Accept: "application/json" } });
+  if (!response.ok) throw new Error(`Ricerca volantino ALDI ${response.status}`);
+  const payload = await response.json();
+  const hits = Array.isArray(payload.hits) ? payload.hits.slice(0, 20) : [];
+  const offers = hits.map(hit => {
+    const pageNumber = String(hit.fields?.page_number || "1");
+    return aldiVerifiedOffer(String(hit.fields?.contents || ""), cleanQuery,
+      `https://volantino.aldi.it/${slug}/page/${encodeURIComponent(pageNumber)}`, pageNumber);
+  }).filter(Boolean).sort((a, b) => a.price - b.price);
+  return {
+    result: offers.map(offer => `${offer.text}\n${offer.link}`).join("\n---\n"),
+    matches: offers.length,
+    offers,
+    finalUrl: `https://volantino.aldi.it/${slug}/page/1`,
+    pageTitle: `Offerte volantino ${location.storeName}`,
+    flyersChecked: 1,
+    indexedPages: Number(payload.found || 0),
+    sourceFormat: "indexed-flyer"
   };
 }
 
@@ -687,7 +815,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 18 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 20 });
     let browser;
     try {
       const body = await request.json();
@@ -696,6 +824,19 @@ export default {
       const adapter = adapterFor(requested.hostname);
       let target = new URL(adapter?.url || requested.href);
       let directLocation = null;
+      if (adapter?.storeFlow === "aldi") {
+        const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
+        directLocation = await resolveAldi(String(body.cap || ""), radius);
+        if (!directLocation.nearby) {
+          return json({ success: true, chainAdapter: "aldi.it", locationApplied: directLocation.locationApplied,
+            nearbyStore: false, nearestDistanceKm: directLocation.nearestDistanceKm ?? null,
+            result: "", matches: 0, offers: [], finalUrl: adapter.url, pageTitle: "" });
+        }
+        const extracted = await searchAldiFlyer(directLocation, String(body.query || "").slice(0, 100));
+        return json({ success: true, chainAdapter: "aldi.it", locationApplied: true, nearbyStore: true,
+          storeName: directLocation.storeName, storeAddress: directLocation.storeAddress,
+          distanceKm: directLocation.distanceKm, storeUrl: directLocation.storeUrl, ...extracted });
+      }
       if (adapter?.storeFlow === "md") {
         const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
         directLocation = await resolveMd(String(body.cap || ""), radius);
