@@ -63,7 +63,7 @@ async function resolveEsselunga(cap, radiusKm = 10) {
   if (!position) return { locationApplied: false, storeUrl: "", targetUrl: "", nearby: false };
   const stores = Array.isArray(storePayload?.stores) ? storePayload.stores : [];
   const ranked = stores
-    .filter(store => Number.isFinite(Number(store.latitude)) && Number.isFinite(Number(store.longitude)) && store.abbrev)
+    .filter(store => !store.laEsse && Number.isFinite(Number(store.latitude)) && Number.isFinite(Number(store.longitude)) && store.abbrev)
     .map(store => ({ ...store, distanceKm: haversineKm(position, { lat: Number(store.latitude), lng: Number(store.longitude) }) }))
     .sort((a, b) => a.distanceKm - b.distanceKm);
   const store = ranked[0];
@@ -296,7 +296,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 15 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 16 });
     let browser;
     try {
       const body = await request.json();
