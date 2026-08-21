@@ -26,6 +26,7 @@ const ESSELUNGA_HERE_KEY = "p-Hih8fjYA1cSsL8gcVmnLj5U871xQ6uSQp4NJ0Ut8A";
 const ALDI_STORE_FINDER_KEY = "J8f9erNQcUhg1nmo5Bhp8wy2A6mQkK";
 
 const ADAPTERS = {
+  "eurospin.it": { url: "https://www.eurospin.it/promozioni/", storeFlow: "eurospin" },
   "lidl.it": { url: "https://www.lidl.it/c/volantino-lidl/s10018048", storeFlow: "lidl" },
   "aldi.it": { url: "https://www.aldi.it/volantino-online", storeFlow: "aldi" },
   "mdspa.it": { url: "https://www.mdspa.it/volantino", storeFlow: "md" },
@@ -97,6 +98,133 @@ async function resolveLidl(cap, radiusKm = 10) {
     storeUrl: "https://www.lidl.it/s/it-IT/ricerca-negozio/",
     targetUrl: "https://www.lidl.it/c/volantino-lidl/s10018048",
     regionId: "400"
+  };
+}
+
+async function resolveEurospin(cap, radiusKm = 10) {
+  const position = await geocodeItalianPostcode(cap);
+  if (!position) return { locationApplied: false, nearby: false };
+  const url = new URL("https://discover.search.hereapi.com/v1/discover");
+  url.searchParams.set("at", `${position.lat},${position.lng}`);
+  url.searchParams.set("q", "Eurospin");
+  url.searchParams.set("limit", "12");
+  url.searchParams.set("lang", "it");
+  url.searchParams.set("apiKey", ESSELUNGA_HERE_KEY);
+  const response = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!response.ok) throw new Error(`Ricerca punti vendita Eurospin ${response.status}`);
+  const payload = await response.json();
+  const store = (Array.isArray(payload?.items) ? payload.items : [])
+    .filter(item => /\beurospin\b/i.test(String(item.title || "")) && item.position)
+    .map(item => ({ ...item, distanceKm: haversineKm(position, item.position) }))
+    .sort((a, b) => a.distanceKm - b.distanceKm)[0];
+  if (!store || store.distanceKm > radiusKm) {
+    return { locationApplied: true, nearby: false,
+      nearestDistanceKm: store ? Number(store.distanceKm.toFixed(1)) : null };
+  }
+  const address = store.address || {};
+  return {
+    locationApplied: true, nearby: true, storeId: String(store.id || ""),
+    storeName: `Eurospin ${address.city || address.district || cap}`,
+    storeAddress: String(address.label || "").replace(/^EUROSPIN,\s*/i, ""),
+    distanceKm: Number(store.distanceKm.toFixed(1)),
+    storeUrl: "https://www.eurospin.it/punti-vendita/",
+    targetUrl: "https://www.eurospin.it/promozioni/"
+  };
+}
+
+function eurospinProductMatches(name, brand, query) {
+  const wanted = normalizeProductSearch(query).trim();
+  const haystack = normalizeProductSearch(`${name} ${brand}`);
+  if (!wanted) return false;
+  const groups = [
+    [/^frutta$/, /\b(?:mel[ae]|per[ae]|pesche|uva|banan[ae]|albicocc[ah]|susin[ae]|prugn[ae]|meloni?|anguri[ae]|fragol[ae]|kiwi|frutta fresca)\b/],
+    [/^(verdura|verdure|ortaggi|ortofrutta)$/, /\b(?:patat[ae]|pomodor[io]|carot[ae]|zucchin[ae]|peperon[ei]|melanzan[ae]|insalat[ae]|cipoll[ae]|verdure?|ortaggi)\b/],
+    [/^(carne|carni|pollame)$/, /\b(?:carne|pollo|tacchino|suino|manzo|salsiccia|hamburger|cotolett[ae])\b/],
+    [/^(pesce|pesci)$/, /\b(?:pesce|tonno|salmone|merluzzo|orata|branzino|gamber[io])\b/],
+    [/^(latticini|formaggi|formaggio)$/, /\b(?:latte|formaggi[oa]|mozzarella|parmigiano|grana|yogurt|ricotta|burro)\b/],
+    [/^(bevande|bibite)$/, /\b(?:acqua|bibit[ae]|succo|succhi|aranciata|cola|birra|vino)\b/]
+  ];
+  const category = groups.find(([pattern]) => pattern.test(wanted))?.[1];
+  if (category) {
+    if (wanted === "frutta" && /\b(?:succo|succhi|polpa|confettura|marmellata|yogurt|bevanda|bibita|bibite|biscotti|cani|gatti|salsa|gelato|colform)\b/.test(haystack)) return false;
+    return category.test(haystack);
+  }
+  return wanted.split(/\s+/).filter(word => word.length > 2).every(word => {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const expression = word.length > 4 && /[aeio]$/.test(word)
+      ? `\\b${escaped.slice(0, -1)}[aeio]?\\b` : `\\b${escaped}\\b`;
+    return new RegExp(expression).test(haystack);
+  });
+}
+
+function eurospinOfferCurrentlyValid(period) {
+  const bounds = period.match(/(\d{1,2})\.(\d{1,2})\s*-\s*(\d{1,2})\.(\d{1,2})/);
+  if (!bounds) return true;
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  const year = Number(today.slice(0, 4));
+  const startMonth = Number(bounds[2]);
+  const endMonth = Number(bounds[4]);
+  const todayMonth = Number(today.slice(5, 7));
+  const startYear = startMonth === 12 && todayMonth === 1 ? year - 1 : year;
+  const endYear = endMonth < startMonth ? startYear + 1 : startYear;
+  const start = `${startYear}-${String(startMonth).padStart(2, "0")}-${bounds[1].padStart(2, "0")}`;
+  const end = `${endYear}-${String(endMonth).padStart(2, "0")}-${bounds[3].padStart(2, "0")}`;
+  return today >= start && today <= end;
+}
+
+function eurospinOffer(card, query, location) {
+  const title = decodeLidlHtml(card.match(/itemprop=["']name["'][^>]*>([\s\S]*?)<\/h2>/i)?.[1]).replace(/\s+/g, " ").trim();
+  const brand = decodeLidlHtml(card.match(/itemprop=["']brand["'][^>]*>([\s\S]*?)<\/div>/i)?.[1]);
+  if (!title || !eurospinProductMatches(title, brand, query)) return null;
+  const validity = decodeLidlHtml(card.match(/class=["']date_current_promo["'][^>]*>([\s\S]*?)<\/div>/i)?.[1]);
+  if (validity && !eurospinOfferCurrentlyValid(validity)) return null;
+  const priceText = decodeLidlHtml(card.match(/itemprop=["']price["'][^>]*>([\s\S]*?)<\/i>/i)?.[1]);
+  const price = Number(priceText.replace(/[^\d,.-]/g, "").replace(",", "."));
+  if (!Number.isFinite(price) || price <= 0) return null;
+  const image = decodeLidlHtml(card.match(/itemprop=["']image["'][^>]*\bsrc=["']([^"']+)/i)?.[1]);
+  const info = decodeLidlHtml(card.match(/class=["']i_price_info["'][^>]*>([\s\S]*?)<\/div>/i)?.[1])
+    .replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+  const unit = info.match(/([\d.,]+)\s*€\s*\/\s*(kg|l)\b/i);
+  let unitPrice = unit ? Number(unit[1].replace(",", ".")) : undefined;
+  let unitMeasure = unit?.[2]?.toUpperCase();
+  const pack = info.match(/(?:(\d+)\s*[x×]\s*)?(\d+(?:[.,]\d+)?)\s*(kg|g|ml|cl|l|lt)\b/i);
+  if (!unitPrice && pack) {
+    const count = Number(pack[1] || 1);
+    const amount = Number(pack[2].replace(",", "."));
+    const measure = pack[3].toLowerCase();
+    const quantity = count * amount / (measure === "g" || measure === "ml" ? 1000 : measure === "cl" ? 100 : 1);
+    unitMeasure = /^(ml|cl|l|lt)$/.test(measure) ? "L" : "KG";
+    if (quantity > 0) unitPrice = Number((price / quantity).toFixed(2));
+  }
+  const unitLabel = unitPrice && unitMeasure ? `€/${unitMeasure.toLowerCase()}` : undefined;
+  const packText = pack ? pack[0] : "";
+  return {
+    code: String(image.match(/\/([^/]+)\.[a-z]+(?:\?|$)/i)?.[1] || `${title}-${brand}`),
+    text: [[title, brand].filter(Boolean).join(" "), packText, `${formatEuro(price)} €`,
+      unitPrice ? `${formatEuro(unitPrice)} ${unitLabel}` : "", "Offerta volantino Eurospin"].filter(Boolean).join(" · "),
+    image, link: location.targetUrl, price, unitPrice, unitMeasure, unitLabel,
+    validPeriod: validity || undefined
+  };
+}
+
+async function searchEurospinOffers(location, query) {
+  const response = await fetch(location.targetUrl, {
+    headers: { Accept: "text/html" }, cf: { cacheTtl: 900, cacheEverything: true }
+  });
+  if (!response.ok) throw new Error(`Promozioni Eurospin ${response.status}`);
+  const html = await response.text();
+  if (html.length > 2000000) throw new Error("Pagina promozioni Eurospin troppo grande");
+  const cards = [...html.matchAll(/<a\b[^>]*class=["'][^"']*sn_promo_grid_item[^"']*["'][\s\S]*?<\/a>/gi)]
+    .map(match => match[0]);
+  if (!cards.length) throw new Error("Prodotti promozionali Eurospin non disponibili");
+  const offers = cards.map(card => eurospinOffer(card, query, location)).filter(Boolean)
+    .filter((offer, index, all) => all.findIndex(item => item.code === offer.code) === index)
+    .sort((a, b) => a.price - b.price);
+  return {
+    result: offers.map(offer => `${offer.text}\n${offer.image}\n${offer.link}`).join("\n---\n"),
+    matches: offers.length, offers, finalUrl: location.targetUrl,
+    pageTitle: `Offerte volantino ${location.storeName}`,
+    flyersChecked: 1, flyerProducts: cards.length, sourceFormat: "eurospin-official-promotions"
   };
 }
 
@@ -1206,7 +1334,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 22 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 23 });
     let browser;
     try {
       const body = await request.json();
@@ -1215,6 +1343,19 @@ export default {
       const adapter = adapterFor(requested.hostname);
       let target = new URL(adapter?.url || requested.href);
       let directLocation = null;
+      if (adapter?.storeFlow === "eurospin") {
+        const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
+        directLocation = await resolveEurospin(String(body.cap || ""), radius);
+        if (!directLocation.nearby) {
+          return json({ success: true, chainAdapter: "eurospin.it", locationApplied: directLocation.locationApplied,
+            nearbyStore: false, nearestDistanceKm: directLocation.nearestDistanceKm ?? null,
+            result: "", matches: 0, offers: [], finalUrl: adapter.url, pageTitle: "" });
+        }
+        const extracted = await searchEurospinOffers(directLocation, String(body.query || "").slice(0, 100));
+        return json({ success: true, chainAdapter: "eurospin.it", locationApplied: true, nearbyStore: true,
+          storeName: directLocation.storeName, storeAddress: directLocation.storeAddress,
+          distanceKm: directLocation.distanceKm, storeUrl: directLocation.storeUrl, ...extracted });
+      }
       if (adapter?.storeFlow === "lidl") {
         const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
         directLocation = await resolveLidl(String(body.cap || ""), radius);
