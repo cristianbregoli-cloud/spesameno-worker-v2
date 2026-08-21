@@ -1690,3 +1690,30 @@ export default {
     }
   }
 };
+
+// SpesaMeno: adattatori aggiuntivi per volantini ufficiali.
+if (!ROOT_HOSTS.includes("maxidi.it")) ROOT_HOSTS.push("maxidi.it");
+
+Object.assign(ADAPTERS, {
+  "rossettogroup.it": {
+    url: "https://rossettogroup.it/prezzi-rossetto-in-corso/",
+    wait: 4500
+  },
+  "supersigma.com": {
+    url: "https://www.supersigma.com/punti-vendita/",
+    wait: 6000
+  },
+  "d-piu.com": {
+    url: "https://dpiu.maxidi.it/punti-vendita",
+    wait: 6500
+  },
+  "maxidi.it": {
+    url: "https://dpiu.maxidi.it/punti-vendita",
+    wait: 6500
+  },
+  "latuaspesa.com": {
+    url: "https://www.latuaspesa.com/category/articoli-in-promozione",
+    wait: 6500
+  }
+});
+
