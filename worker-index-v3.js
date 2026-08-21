@@ -1,4 +1,5 @@
 import puppeteer from "@cloudflare/puppeteer";
+import { inflateSync } from "node:zlib";
 
 const ROOT_HOSTS = [
   "italmark.it", "penny.it", "aldi.it", "mdspa.it", "esselunga.it", "carrefour.it",
@@ -362,6 +363,187 @@ async function resolveConad(cap, radiusKm = 10) {
   };
 }
 
+const CONAD_PDF_NUMBER = "-?(?:\\d+\\.?\\d*|\\.\\d+)";
+const CONAD_PDF_OPERATOR = new RegExp(`(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+Tm|(${CONAD_PDF_NUMBER})\\s+(${CONAD_PDF_NUMBER})\\s+Td|(\\[(?:[^\\]\\\\]|\\\\[\\s\\S])*\\])\\s*TJ|(\\((?:[^()\\\\]|\\\\[\\s\\S])*\\))\\s*Tj`, "g");
+const CONAD_CATEGORY_WORDS = {
+  frutta: ["frutt", "mela", "mele", "pera", "pere", "pesc", "nettari", "susin", "uva", "angur", "melon", "frag", "mirtil", "banana", "albicocc", "kiwi", "avocado", "ananas", "aranc", "limon"],
+  verdura: ["verdur", "ortofrutt", "patat", "pomodor", "peperon", "cetriol", "lattug", "insalat", "zucchin", "melanzan", "carot", "cipoll", "fagiolin", "spinac", "finocch"],
+  carne: ["carn", "pollo", "vitell", "manz", "bovin", "suin", "maial", "salsicc", "salamell", "hamburger", "tagliat", "fettin", "tacchin", "angus"],
+  pesce: ["pesc", "tonn", "salmon", "merluzz", "orata", "branzin", "gamber", "sardin", "sgombr", "polpo"],
+  latticini: ["latt", "yogurt", "mozzarell", "formagg", "ricott", "burro", "parmigian", "grana", "stracchin", "philadelphia"],
+  bevande: ["acqua", "bibit", "coca", "succh", "birr", "vin", "bevanda", "aranciat", "nettare"]
+};
+
+function conadPdfString(value) {
+  return value.replace(/\\([0-7]{1,3}|n|r|t|b|f|[()\\]|\r?\n)/g, (_, escaped) => {
+    if (/^[0-7]/.test(escaped)) {
+      const code = parseInt(escaped, 8);
+      return code === 128 ? "€" : String.fromCharCode(code);
+    }
+    return ({ n: "\n", r: "\r", t: "\t", b: "\b", f: "\f" })[escaped]
+      ?? (escaped.includes("\n") ? "" : escaped);
+  }).replace(/\s+/g, " ").trim();
+}
+
+function conadPdfRuns(content) {
+  let x = 0, y = 0, scaleX = 1, scaleY = 1;
+  const runs = [];
+  for (const item of content.matchAll(CONAD_PDF_OPERATOR)) {
+    if (item[1] !== undefined) {
+      scaleX = Number(item[1]); scaleY = Number(item[4]); x = Number(item[5]); y = Number(item[6]);
+      continue;
+    }
+    if (item[7] !== undefined) {
+      x += Number(item[7]) * scaleX; y += Number(item[8]) * scaleY;
+      continue;
+    }
+    const parts = item[9] ? [...item[9].matchAll(/\(((?:[^()\\]|\\[\s\S])*)\)/g)].map(part => part[1])
+      : [item[10].slice(1, -1)];
+    const text = conadPdfString(parts.join(""));
+    if (text) runs.push({ x, y, size: Math.abs(scaleY), text });
+    if (runs.length >= 2500) break;
+  }
+  return runs;
+}
+
+function conadQueryMatches(value, query) {
+  const text = String(value || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const terms = String(query || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .split(/\s+/).filter(term => term.length >= 3);
+  if (!terms.length) return false;
+  if (terms.length === 1 && CONAD_CATEGORY_WORDS[terms[0]]) {
+    return CONAD_CATEGORY_WORDS[terms[0]].some(term => new RegExp(`\\b${term}`).test(text));
+  }
+  return terms.every(term => {
+    const stem = term.length > 4 && /[aeiou]$/.test(term) ? term.slice(0, -1) : term;
+    return new RegExp(`\\b${stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[aeiou])?\\b`).test(text);
+  });
+}
+
+function conadMoneyRuns(runs) {
+  const prices = [];
+  for (let index = 0; index < runs.length; index++) {
+    const run = runs[index];
+    if (/\/\s*(?:kg|l|lt|litro|conf|pz)/i.test(run.text) || run.size < 15) continue;
+    const direct = run.text.match(/^€?\s*(\d{1,3}[,.]\d{2})\s*€?$/);
+    if (direct) {
+      prices.push({ ...run, price: Number(direct[1].replace(",", ".")) });
+      continue;
+    }
+    if (!/^\d{1,3}$/.test(run.text) || run.size < 25) continue;
+    const cents = runs.find(other => /^,\d{2}$/.test(other.text)
+      && Math.abs(other.y - run.y) <= 3 && other.x > run.x && other.x - run.x <= 140);
+    if (cents) prices.push({ ...run, price: Number(`${run.text}.${cents.text.slice(1)}`) });
+  }
+  return prices.filter((price, index) => price.price > 0 && price.price < 1000
+    && prices.findIndex(other => other.price === price.price
+      && Math.abs(other.x - price.x) < 3 && Math.abs(other.y - price.y) < 3) === index);
+}
+
+function conadOfferForRun(run, runs, prices, query, pdfUrl, pageNumber) {
+  if (run.size < 7 || run.text.length > 100 || /offerta valida|catalogo|punti vendita|condizioni|spesaonline/i.test(run.text)) return null;
+  if (!conadQueryMatches(run.text, query)) return null;
+  const candidates = prices.map(price => {
+    const dx = price.x - run.x;
+    const dy = run.y - price.y;
+    if (Math.abs(dx) > 190 || dy < -45 || dy > 285) return null;
+    const score = Math.abs(dx) * 1.15 + Math.abs(dy) * 0.8 + (dx < -125 ? 55 : 0) + (dy < -15 ? 60 : 0);
+    return { price, score };
+  }).filter(Boolean).sort((a, b) => a.score - b.score);
+  if (!candidates.length) return null;
+  const selected = candidates[0].price;
+  const details = runs.filter(other => other !== run && other.size >= 7 && other.size <= Math.max(run.size * 1.35, 20)
+    && Math.abs(other.x - run.x) <= 75 && other.y <= run.y + 2 && other.y > selected.y - 20
+    && !/^€|^\/|^,\d|^\d{1,3}$|offerta|titolari|origine|cat\./i.test(other.text))
+    .sort((a, b) => b.y - a.y).slice(0, 5);
+  const nameParts = [run.text];
+  for (const detail of details) {
+    if (detail.text === run.text || nameParts.some(part => part === detail.text)) continue;
+    if (/^(?:confezione\s*)?(?:\d+[,.]?\d*\s*(?:x\s*\d+)?\s*(?:kg|g|ml|cl|l|lt))\b/i.test(detail.text)) continue;
+    if (detail.text.length <= 45 && detail.y > selected.y + 3) nameParts.push(detail.text);
+    if (nameParts.length >= 3) break;
+  }
+  const nearby = runs.filter(other => Math.abs(other.x - selected.x) <= 155 && Math.abs(other.y - selected.y) <= 135);
+  const unit = nearby.map(other => ({ match: other.text.match(/(?:€\s*)?\/\s*(kg|l|lt)\s*(\d+[,.]\d{2})/i),
+    distance: Math.abs(other.x - selected.x) + Math.abs(other.y - selected.y) * 0.7 }))
+    .filter(item => item.match).sort((a, b) => a.distance - b.distance)[0]?.match;
+  const weightLine = [...details, ...runs.filter(other => Math.abs(other.x - run.x) <= 145
+    && other.y <= run.y + 3 && other.y >= selected.y - 8)]
+    .filter(other => /(?:confezione\s*)?\d+[,.]?\d*\s*(?:x\s*\d+\s*)?(?:kg|g|ml|cl|l|lt)\b/i.test(other.text))
+    .sort((a, b) => Math.abs(a.x - run.x) - Math.abs(b.x - run.x))[0]?.text;
+  let unitPrice = unit ? Number(unit[2].replace(",", ".")) : null;
+  let unitLabel = unit ? unit[1].toLowerCase().startsWith("l") ? "€/l" : "€/kg" : "";
+  if (!unitPrice && weightLine) {
+    const weight = weightLine.match(/(\d+[,.]?\d*)\s*(?:x\s*(\d+[,.]?\d*)\s*)?(kg|g|ml|cl|l|lt)\b/i);
+    if (weight) {
+      const amount = Number(weight[1].replace(",", ".")) * Number((weight[2] || "1").replace(",", "."));
+      const measure = weight[3].toLowerCase();
+      const base = measure === "g" || measure === "ml" ? amount / 1000 : measure === "cl" ? amount / 100 : amount;
+      if (base > 0) { unitPrice = Number((selected.price / base).toFixed(2)); unitLabel = /ml|cl|^l/.test(measure) ? "€/l" : "€/kg"; }
+    }
+  }
+  if (!unitPrice && nearby.some(other => /^\/?\s*kg\s*$|^€\s*\/\s*kg\s*$/i.test(other.text))) {
+    unitPrice = selected.price; unitLabel = "€/kg";
+  }
+  const name = nameParts.join(" ").replace(/\s+/g, " ").trim();
+  const displayPrice = selected.price.toFixed(2).replace(".", ",");
+  const displayUnit = unitPrice ? ` · ${unitPrice.toFixed(2).replace(".", ",")} ${unitLabel}` : "";
+  return { code: `conad-pdf-${pageNumber}-${Math.round(selected.x)}-${Math.round(selected.y)}-${displayPrice}`,
+    name, text: `${name}${weightLine ? ` · ${weightLine}` : ""} · ${displayPrice} €${displayUnit}`,
+    price: selected.price, unitPrice, unitLabel, image: "", link: `${pdfUrl}#page=${pageNumber}`, pageNumber };
+}
+
+async function searchConadPdfFlyer(pdfUrl, query) {
+  const response = await fetch(pdfUrl, { headers: { Accept: "application/pdf" } });
+  if (!response.ok) throw new Error(`PDF volantino Conad ${response.status}`);
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (declaredLength > 30000000) throw new Error("Volantino Conad troppo grande");
+  const buffer = new Uint8Array(await response.arrayBuffer());
+  if (buffer.length > 30000000) throw new Error("Volantino Conad troppo grande");
+  const raw = new TextDecoder("latin1").decode(buffer);
+  const objects = new Map();
+  const pages = [];
+  for (const object of raw.matchAll(/(?:^|[\r\n])(\d+)\s+\d+\s+obj\b([\s\S]*?)\bendobj\b/g)) {
+    const body = object[2];
+    objects.set(object[1], { body, offset: object.index + object[0].indexOf(body) });
+    const header = body.slice(0, body.indexOf("stream") < 0 ? 3000 : body.indexOf("stream"));
+    if (!/\/Type\s*\/Page\b/.test(header)) continue;
+    const refs = header.match(/\/Contents\s*\[([^\]]+)\]/)?.[1] || header.match(/\/Contents\s+(\d+\s+\d+\s+R)/)?.[1] || "";
+    pages.push([...refs.matchAll(/(\d+)\s+\d+\s+R/g)].map(reference => reference[1]));
+  }
+  const offers = [];
+  for (let pageIndex = 0; pageIndex < Math.min(pages.length, 28); pageIndex++) {
+    const runs = [];
+    for (const id of pages[pageIndex]) {
+      const object = objects.get(id);
+      if (!object) continue;
+      const marker = object.body.indexOf("stream");
+      if (marker < 0) continue;
+      const header = object.body.slice(0, marker);
+      let start = object.offset + marker + 6;
+      if (buffer[start] === 13) start++;
+      if (buffer[start] === 10) start++;
+      const length = Number(header.match(/\/Length\s+(\d+)(?!\s+\d+\s+R)/)?.[1] || 0);
+      const end = length ? start + length : raw.indexOf("endstream", start);
+      if (end <= start || end - start > 600000) continue;
+      try {
+        const decoded = /\/FlateDecode/.test(header) ? inflateSync(buffer.subarray(start, end)) : buffer.subarray(start, end);
+        if (decoded.length > 1200000) continue;
+        runs.push(...conadPdfRuns(new TextDecoder("latin1").decode(decoded)));
+      } catch { continue; }
+    }
+    const matches = runs.filter(run => conadQueryMatches(run.text, query));
+    if (!matches.length) continue;
+    const prices = conadMoneyRuns(runs);
+    for (const run of matches) {
+      const offer = conadOfferForRun(run, runs, prices, query, pdfUrl, pageIndex + 1);
+      if (offer && !offers.some(previous => previous.code === offer.code)) offers.push(offer);
+      if (offers.length >= 24) return { offers, pagesChecked: pageIndex + 1, totalPages: pages.length };
+    }
+  }
+  return { offers, pagesChecked: pages.length, totalPages: pages.length };
+}
+
 async function searchConadFlyers(location, query) {
   const url = new URL("https://www.conad.it/api/corporate/it-it.flyers.json");
   url.searchParams.set("anacanId", location.storeId);
@@ -376,18 +558,38 @@ async function searchConadFlyers(location, query) {
     return (!from || from <= now) && (!to || to + 86400000 > now);
   });
   const structured = flyers.filter(flyer => flyer.hasDisaggregated && Number(flyer.disTotalProducts || 0) > 0 && flyer.link?.href);
+  const cleanQuery = String(query || "").trim().slice(0, 100);
   const offers = [];
   for (const flyer of structured.slice(0, 3)) {
     const page = await fetch(flyer.link.href, { headers: { Accept: "text/html" } });
     if (!page.ok) continue;
     const html = await page.text();
     if (html.length > 3000000) continue;
-    const extracted = directExtract(html, String(query || ""));
+    const extracted = directExtract(html, cleanQuery);
     for (const offer of extracted.offers) {
       const amount = offer.text.match(/(\d+[,.]\d{2})\s*€/);
       if (!amount) continue;
       offers.push({ ...offer, code: `${flyer.disaggregatedId}-${offer.text}`, link: flyer.link.href,
         price: Number(amount[1].replace(",", ".")) });
+    }
+  }
+  let pdfPagesChecked = 0;
+  let readablePdfFlyers = 0;
+  if (cleanQuery && !offers.length) {
+    const produce = /frutta|verdura|ortofrutta|patat|pomodor|peperon|melone|pesche|uva|fragol|zucchin|lattug|insalat|cetriol|anguri/i.test(cleanQuery);
+    const pdfFlyers = flyers.filter(flyer => flyer.pdfUrl && !/parafarmacia|catalogo|premio|conad card/i.test(String(flyer.title || flyer.name || "")))
+      .sort((a, b) => produce ? Number(/ortofrutt/i.test(String(b.title || b.name || "")))
+        - Number(/ortofrutt/i.test(String(a.title || a.name || ""))) : 0);
+    for (const flyer of pdfFlyers.slice(0, 2)) {
+      try {
+        const extracted = await searchConadPdfFlyer(String(flyer.pdfUrl), cleanQuery);
+        readablePdfFlyers++;
+        pdfPagesChecked += extracted.pagesChecked;
+        offers.push(...extracted.offers);
+        if (offers.length) break;
+      } catch (error) {
+        console.warn("conad_pdf_flyer_failed", { storeId: location.storeId, message: error.message });
+      }
     }
   }
   const unique = offers.filter((offer, index) => offers.findIndex(item => item.code === offer.code) === index)
@@ -400,7 +602,9 @@ async function searchConadFlyers(location, query) {
     pageTitle: `Offerte volantino ${location.storeName}`,
     flyersChecked: flyers.length,
     structuredFlyers: structured.length,
-    sourceFormat: structured.length ? "structured" : flyers.length ? "pdf" : "none"
+    readablePdfFlyers,
+    pdfPagesChecked,
+    sourceFormat: structured.length ? "structured" : readablePdfFlyers ? "pdf-extracted" : flyers.length ? "pdf" : "none"
   };
 }
 
@@ -815,7 +1019,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 20 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 21 });
     let browser;
     try {
       const body = await request.json();
