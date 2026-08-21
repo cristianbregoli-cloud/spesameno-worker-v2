@@ -23,8 +23,8 @@ const ESSELUNGA_STORES_URL = "https://www.esselunga.it/services/istituzionale35/
 const ESSELUNGA_HERE_KEY = "p-Hih8fjYA1cSsL8gcVmnLj5U871xQ6uSQp4NJ0Ut8A";
 
 const ADAPTERS = {
-  "aldi.it": { url: "https://www.aldi.it/speciali-della-settimana", wait: 6000 },
-  "mdspa.it": { url: "https://volantino.mdspa.it/m_nord.html", direct: true },
+  "aldi.it": { url: "https://www.aldi.it/offerte-settimanali/offerte-di-questa-settimana", wait: 6000 },
+  "mdspa.it": { url: "https://www.mdspa.it/volantino", storeFlow: "md" },
   "esselunga.it": { url: "https://www.esselunga.it/it-it/negozi.html", wait: 5000, storeFlow: "esselunga" },
   "carrefour.it": { url: "https://www.carrefour.it/volantino", wait: 5000 },
   "conad.it": { url: "https://www.conad.it/ricerca-negozi", wait: 5000, storeFlow: "conad" },
@@ -44,6 +44,236 @@ function haversineKm(a, b) {
   const lat2 = radians(b.lat);
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
   return 6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+async function geocodeItalianPostcode(cap) {
+  if (!/^\d{5}$/.test(cap)) return null;
+  const url = new URL("https://geocode.search.hereapi.com/v1/geocode");
+  url.searchParams.set("q", `${cap} Italia`);
+  url.searchParams.set("in", "countryCode:ITA");
+  url.searchParams.set("lang", "it");
+  url.searchParams.set("apiKey", ESSELUNGA_HERE_KEY);
+  const response = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!response.ok) throw new Error(`Geolocalizzazione CAP ${response.status}`);
+  const payload = await response.json();
+  return payload?.items?.find(item => item?.position)?.position || null;
+}
+
+async function resolveMd(cap, radiusKm = 10) {
+  const position = await geocodeItalianPostcode(cap);
+  if (!position) return { locationApplied: false, nearby: false };
+
+  const listUrl = new URL("https://www.mdspa.it/punti_vendita_admin/listnew.php");
+  listUrl.searchParams.set("latitudine", String(position.lat));
+  listUrl.searchParams.set("longitudine", String(position.lng));
+  listUrl.searchParams.set("luogocercare", cap);
+  const response = await fetch(listUrl, { headers: { Accept: "text/html" } });
+  if (!response.ok) throw new Error(`Ricerca punti vendita MD ${response.status}`);
+  const html = await response.text();
+  if (html.length > 1500000) throw new Error("Elenco punti vendita MD troppo grande");
+  const ids = [...new Set([...html.matchAll(/\/(\d+)-[\w%-]+/g)].map(match => match[1]))].slice(0, 8);
+
+  const details = await Promise.allSettled(ids.map(async id => {
+    const result = await fetch("https://www.mdspa.it/punti_vendita_admin/get_pv.php", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      body: new URLSearchParams({ pv: id })
+    });
+    if (!result.ok) throw new Error(`Punto vendita MD ${result.status}`);
+    const payload = await result.json();
+    const store = payload?.pv;
+    const lat = Number(store?.latitudine);
+    const lng = Number(store?.longitudine);
+    if (!store || !Number.isFinite(lat) || !Number.isFinite(lng) || !Number(store.zona_id)) return null;
+    return { ...store, distanceKm: haversineKm(position, { lat, lng }) };
+  }));
+
+  const ranked = details.filter(item => item.status === "fulfilled" && item.value)
+    .map(item => item.value)
+    .sort((a, b) => a.distanceKm - b.distanceKm);
+  const store = ranked[0];
+  if (!store || store.distanceKm > radiusKm) {
+    return { locationApplied: true, nearby: false, nearestDistanceKm: store ? Number(store.distanceKm.toFixed(1)) : null };
+  }
+
+  return {
+    locationApplied: true,
+    nearby: true,
+    storeId: String(store.id),
+    storeName: `MD ${String(store.citta || "").trim()}`,
+    storeAddress: [store.indirizzo, store.cap, store.citta].filter(Boolean).join(", "),
+    distanceKm: Number(store.distanceKm.toFixed(1)),
+    storeUrl: String(store.link_scheda || ""),
+    targetUrl: `https://www.mdspa.it/sfogliatore/?id_pv=${encodeURIComponent(store.id)}`,
+    validity: String(store.breve_zona || "")
+  };
+}
+
+function normalizeProductSearch(value) {
+  return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+function mdProductMatches(product, query) {
+  const wanted = normalizeProductSearch(query).trim();
+  if (!wanted) return false;
+  const groups = [
+    [/^(frutta|verdura|ortofrutta|ortaggi)$/, /^ORTOFRUTTA$/i],
+    [/^(carne|carni|pollame)$/, /^CARNI$/i],
+    [/^(latticini|latte|formaggi|formaggio|salumi|uova|yogurt)$/, /^(FRESCO|GASTRONOMIA)$/i],
+    [/^(bevande|bibite|acqua|birra|vino|vini)$/, /^BEVANDE$/i],
+    [/^(surgelati|gelati|pesce)$/, /^FREDDO$/i],
+    [/^(detersivi|detersivo|pulizia)$/, /^CURA CASA$/i],
+    [/^(igiene|cosmetici)$/, /^CURA PERSONA$/i]
+  ];
+  const category = groups.find(([pattern]) => pattern.test(wanted))?.[1];
+  if (category) return category.test(String(product.category || ""));
+  const haystack = normalizeProductSearch([product.name, product.title, product.brand, product.description, product.section].join(" "));
+  return wanted.split(/\s+/).filter(word => word.length > 2)
+    .every(word => haystack.includes(word.length > 4 ? word.slice(0, -1) : word));
+}
+
+function mdOffer(product, flyerUrl) {
+  const price = Number(product.priceOff || product.price);
+  const title = String(product.title || product.name || "").trim();
+  if (!title || !Number.isFinite(price) || price <= 0) return null;
+
+  const weight = Number(product.weight || 0);
+  const measure = String(product.weight_um || "").trim().toLowerCase();
+  const divisor = measure === "g" || measure === "ml" ? 1000 : measure === "cl" ? 100 : 1;
+  const quantity = weight / divisor;
+  const unitMeasure = /^(ml|cl|l|lt)$/.test(measure) ? "L" : /^(g|kg)$/.test(measure) ? "KG" : "";
+  const unitPrice = quantity > 0 && unitMeasure ? Number((price / quantity).toFixed(2)) : undefined;
+  const imagePath = (Array.isArray(product.photos) ? product.photos : []).find(photo => photo.isDefault)?.imageUrl
+    || product.photos?.[0]?.imageUrl || "";
+  const name = [title, String(product.brand || "").trim()].filter(Boolean).join(" ");
+  const weightText = weight > 0 && measure ? `${weight} ${measure}` : "";
+  const unitText = unitPrice ? `${formatEuro(unitPrice)} €/${unitMeasure.toLowerCase()}` : "";
+
+  return {
+    code: String(product.idProduct || product.code || name),
+    text: [name, weightText, `${formatEuro(price)} €`, unitText, "Offerta volantino"].filter(Boolean).join(" · "),
+    image: imagePath ? new URL(imagePath, "https://service-volantino.mdspa.it").href : "",
+    link: flyerUrl,
+    price,
+    unitPrice,
+    unitMeasure: unitMeasure || undefined
+  };
+}
+
+async function searchMdFlyer(location, query) {
+  const localResponse = await fetch(location.targetUrl, { headers: { Accept: "text/html" } });
+  if (!localResponse.ok) throw new Error(`Volantino locale MD ${localResponse.status}`);
+  const localHtml = await localResponse.text();
+  if (localHtml.length > 1500000) throw new Error("Pagina volantino MD troppo grande");
+  const flyerCode = localHtml.match(/data-flyer-code=["']([a-z0-9_-]+)["']/i)?.[1];
+  if (!flyerCode) throw new Error("Codice volantino locale MD non disponibile");
+
+  const flyerUrl = `https://service-volantino.mdspa.it/${encodeURIComponent(flyerCode)}`;
+  const response = await fetch(flyerUrl, { headers: { Accept: "text/html" } });
+  if (!response.ok) throw new Error(`Catalogo offerte MD ${response.status}`);
+  const html = await response.text();
+  if (html.length > 5000000) throw new Error("Catalogo offerte MD troppo grande");
+  const serialized = html.match(/\bvar\s+data\s*=\s*(\[[\s\S]*?\]);/)?.[1];
+  if (!serialized) throw new Error("Prodotti volantino MD non disponibili");
+  const products = JSON.parse(serialized);
+  if (!Array.isArray(products)) throw new Error("Formato catalogo MD non valido");
+
+  const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Europe/Rome" });
+  const offers = products.filter(product => {
+    const starts = String(product.sellOutStart || "").slice(0, 10);
+    const ends = String(product.sellOutEnd || "").slice(0, 10);
+    return (!starts || starts <= today) && (!ends || ends >= today) && mdProductMatches(product, query);
+  }).map(product => mdOffer(product, flyerUrl)).filter(Boolean)
+    .sort((a, b) => a.price - b.price);
+
+  return {
+    result: offers.map(offer => `${offer.text}\n${offer.image}\n${offer.link}`).join("\n---\n"),
+    matches: offers.length,
+    offers,
+    finalUrl: flyerUrl,
+    pageTitle: `Offerte volantino ${location.storeName}`,
+    flyersChecked: 1,
+    flyerValidity: location.validity,
+    flyerProducts: products.length
+  };
+}
+
+async function resolveConad(cap, radiusKm = 10) {
+  const position = await geocodeItalianPostcode(cap);
+  if (!position) return { locationApplied: false, nearby: false };
+  const response = await fetch("https://www.conad.it/api/corporate/it-it.retrievePointOfService.json", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ latitudine: position.lat, longitudine: position.lng, raggioRicerca: radiusKm,
+      insegneId: [], serviziId: [], repartiId: [], apertura: [] })
+  });
+  if (!response.ok) throw new Error(`Ricerca punti vendita Conad ${response.status}`);
+  const payload = await response.json();
+  const stores = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
+  const ranked = stores.map(store => {
+    const distance = Number(store.distanza);
+    const lat = Number(store.latitudine);
+    const lng = Number(store.longitudine);
+    const distanceKm = Number.isFinite(distance) && distance >= 0 ? distance
+      : Number.isFinite(lat) && Number.isFinite(lng) ? haversineKm(position, { lat, lng }) : Infinity;
+    return { ...store, distanceKm };
+  }).filter(store => store.anacanId && Number(store.volantiniCount || 0) > 0)
+    .sort((a, b) => a.distanceKm - b.distanceKm);
+  const store = ranked[0];
+  if (!store || store.distanceKm > radiusKm) {
+    return { locationApplied: true, nearby: false, nearestDistanceKm: store ? Number(store.distanceKm.toFixed(1)) : null };
+  }
+  return {
+    locationApplied: true,
+    nearby: true,
+    storeId: String(store.anacanId),
+    storeName: String(store.pdvTitle || "Conad"),
+    storeAddress: String(store.pdvAddress || ""),
+    distanceKm: Number(store.distanceKm.toFixed(1)),
+    storeUrl: String(store.pdvPlainUrl || "")
+  };
+}
+
+async function searchConadFlyers(location, query) {
+  const url = new URL("https://www.conad.it/api/corporate/it-it.flyers.json");
+  url.searchParams.set("anacanId", location.storeId);
+  const response = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!response.ok) throw new Error(`Volantini Conad ${response.status}`);
+  const payload = await response.json();
+  const allFlyers = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
+  const now = Date.now();
+  const flyers = allFlyers.filter(flyer => {
+    const from = Number(flyer.validFrom || 0);
+    const to = Number(flyer.validTo || 0);
+    return (!from || from <= now) && (!to || to + 86400000 > now);
+  });
+  const structured = flyers.filter(flyer => flyer.hasDisaggregated && Number(flyer.disTotalProducts || 0) > 0 && flyer.link?.href);
+  const offers = [];
+  for (const flyer of structured.slice(0, 3)) {
+    const page = await fetch(flyer.link.href, { headers: { Accept: "text/html" } });
+    if (!page.ok) continue;
+    const html = await page.text();
+    if (html.length > 3000000) continue;
+    const extracted = directExtract(html, String(query || ""));
+    for (const offer of extracted.offers) {
+      const amount = offer.text.match(/(\d+[,.]\d{2})\s*€/);
+      if (!amount) continue;
+      offers.push({ ...offer, code: `${flyer.disaggregatedId}-${offer.text}`, link: flyer.link.href,
+        price: Number(amount[1].replace(",", ".")) });
+    }
+  }
+  const unique = offers.filter((offer, index) => offers.findIndex(item => item.code === offer.code) === index)
+    .sort((a, b) => a.price - b.price);
+  return {
+    result: unique.map(offer => `${offer.text}\n${offer.link}`).join("\n---\n"),
+    matches: unique.length,
+    offers: unique,
+    finalUrl: flyers[0]?.link?.href || location.storeUrl,
+    pageTitle: `Offerte volantino ${location.storeName}`,
+    flyersChecked: flyers.length,
+    structuredFlyers: structured.length,
+    sourceFormat: structured.length ? "structured" : flyers.length ? "pdf" : "none"
+  };
 }
 
 async function resolveEsselunga(cap, radiusKm = 10) {
@@ -457,7 +687,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 17 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 18 });
     let browser;
     try {
       const body = await request.json();
@@ -466,6 +696,32 @@ export default {
       const adapter = adapterFor(requested.hostname);
       let target = new URL(adapter?.url || requested.href);
       let directLocation = null;
+      if (adapter?.storeFlow === "md") {
+        const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
+        directLocation = await resolveMd(String(body.cap || ""), radius);
+        if (!directLocation.nearby) {
+          return json({ success: true, chainAdapter: "mdspa.it", locationApplied: directLocation.locationApplied,
+            nearbyStore: false, nearestDistanceKm: directLocation.nearestDistanceKm ?? null,
+            result: "", matches: 0, offers: [], finalUrl: adapter.url, pageTitle: "" });
+        }
+        const extracted = await searchMdFlyer(directLocation, String(body.query || "").slice(0, 100));
+        return json({ success: true, chainAdapter: "mdspa.it", locationApplied: true, nearbyStore: true,
+          storeName: directLocation.storeName, storeAddress: directLocation.storeAddress,
+          distanceKm: directLocation.distanceKm, storeUrl: directLocation.storeUrl, ...extracted });
+      }
+      if (adapter?.storeFlow === "conad") {
+        const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
+        directLocation = await resolveConad(String(body.cap || ""), radius);
+        if (!directLocation.nearby) {
+          return json({ success: true, chainAdapter: "conad.it", locationApplied: directLocation.locationApplied,
+            nearbyStore: false, nearestDistanceKm: directLocation.nearestDistanceKm ?? null,
+            result: "", matches: 0, offers: [], finalUrl: adapter.url, pageTitle: "" });
+        }
+        const extracted = await searchConadFlyers(directLocation, String(body.query || "").slice(0, 100));
+        return json({ success: true, chainAdapter: "conad.it", locationApplied: true, nearbyStore: true,
+          storeName: directLocation.storeName, storeAddress: directLocation.storeAddress,
+          distanceKm: directLocation.distanceKm, storeUrl: directLocation.storeUrl, ...extracted });
+      }
       if (adapter?.storeFlow === "esselunga") {
         const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
         directLocation = await resolveEsselunga(String(body.cap || ""), radius);
