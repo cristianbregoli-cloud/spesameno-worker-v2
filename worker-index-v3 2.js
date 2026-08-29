@@ -1700,8 +1700,11 @@ Object.assign(ADAPTERS, {
     wait: 4500
   },
   "supersigma.com": {
-    url: "https://www.supersigma.com/punti-vendita/",
-    wait: 6000
+    // Il sito principale reindirizza il browser automatico alla pagina
+    // generica. Il volantino locale ufficiale espone invece prodotti, prezzi,
+    // unita di misura e fotografie durante il caricamento della pagina.
+    url: "https://digitalflyers-ceu.supersigma.com/punti-vendita/sigma-di-brescia-via-livorno/promozioni/sigma-promo-17",
+    wait: 12000
   },
   "d-piu.com": {
     url: "https://dpiu.maxidi.it/punti-vendita",
@@ -1716,4 +1719,3 @@ Object.assign(ADAPTERS, {
     wait: 6500
   }
 });
-
