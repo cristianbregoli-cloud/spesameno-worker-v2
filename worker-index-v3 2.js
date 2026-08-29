@@ -1521,7 +1521,7 @@ async function extractOffers(page, query, payloads) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
-    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 24 });
+    if (request.method !== "POST") return json({ ok: true, service: "SpesaMeno adapters", version: 25 });
     let browser;
     try {
       const body = await request.json();
@@ -1538,10 +1538,16 @@ export default {
             nearbyStore: false, nearestDistanceKm: directLocation.nearestDistanceKm ?? null,
             result: "", matches: 0, offers: [], finalUrl: adapter.url, pageTitle: "" });
         }
-        const extracted = await searchIperalOffers(directLocation, String(body.query || "").slice(0, 100));
-        return json({ success: true, chainAdapter: "iperal.it", locationApplied: true, nearbyStore: true,
-          storeName: directLocation.storeName, storeAddress: directLocation.storeAddress,
-          distanceKm: directLocation.distanceKm, storeUrl: directLocation.storeUrl, ...extracted });
+        try {
+          const extracted = await searchIperalOffers(directLocation, String(body.query || "").slice(0, 100));
+          return json({ success: true, chainAdapter: "iperal.it", locationApplied: true, nearbyStore: true,
+            storeName: directLocation.storeName, storeAddress: directLocation.storeAddress,
+            distanceKm: directLocation.distanceKm, storeUrl: directLocation.storeUrl, ...extracted });
+        } catch {
+          // Se il server PDF rifiuta la richiesta diretta, il browser apre la
+          // pagina promozioni ufficiale e intercetta i dati caricati dal sito.
+          target = new URL(adapter.url);
+        }
       }
       if (adapter?.storeFlow === "eurospin") {
         const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
@@ -1577,10 +1583,16 @@ export default {
             nearbyStore: false, nearestDistanceKm: directLocation.nearestDistanceKm ?? null,
             result: "", matches: 0, offers: [], finalUrl: adapter.url, pageTitle: "" });
         }
-        const extracted = await searchAldiFlyer(directLocation, String(body.query || "").slice(0, 100));
-        return json({ success: true, chainAdapter: "aldi.it", locationApplied: true, nearbyStore: true,
-          storeName: directLocation.storeName, storeAddress: directLocation.storeAddress,
-          distanceKm: directLocation.distanceKm, storeUrl: directLocation.storeUrl, ...extracted });
+        try {
+          const extracted = await searchAldiFlyer(directLocation, String(body.query || "").slice(0, 100));
+          return json({ success: true, chainAdapter: "aldi.it", locationApplied: true, nearbyStore: true,
+            storeName: directLocation.storeName, storeAddress: directLocation.storeAddress,
+            distanceKm: directLocation.distanceKm, storeUrl: directLocation.storeUrl, ...extracted });
+        } catch {
+          // Il sito può bloccare il download server-to-server pur restando
+          // consultabile nel browser: in quel caso usiamo il lettore visuale.
+          target = new URL(adapter.url);
+        }
       }
       if (adapter?.storeFlow === "md") {
         const radius = Math.min(100, Math.max(1, Number(body.radius || body.radiusKm || 10)));
